@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>subthx</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <header class="bar" data-tauri-drag-region>
+      <div class="brand" data-tauri-drag-region>
+        <span class="seal" aria-hidden="true"><span></span></span>
+        <span class="wordmark">subthx</span>
+      </div>
+
+      <div class="bar-end">
+        <button class="engine" id="engine" type="button" data-state="idle">
+          <span class="engine-dot" aria-hidden="true"></span>
+          <span class="engine-text"></span>
+        </button>
+        <button class="icon-btn" id="open-settings" type="button">
+          <svg viewBox="0 0 20 20" aria-hidden="true">
+            <path d="M3.5 6h8M15.5 6h1M3.5 14h1M8.5 14h8" />
+            <circle cx="13.5" cy="6" r="2" />
+            <circle cx="6.5" cy="14" r="2" />
+          </svg>
+        </button>
+        <div class="winctl" id="winctl" hidden>
+          <button type="button" id="win-min">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5.5 10h9" /></svg>
+          </button>
+          <button type="button" id="win-max">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="5.5" y="5.5" width="9" height="9" rx="1.5" /></svg>
+          </button>
+          <button type="button" id="win-close" class="close">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 6l8 8M14 6l-8 8" /></svg>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main id="main" class="main"></main>
+
+    <div class="veil" id="veil" aria-hidden="true">
+      <div class="veil-frame">
+        <span class="seal seal-lg"><span></span></span>
+        <p id="veil-text"></p>
+      </div>
+    </div>
+
+    <dialog class="sheet" id="settings" aria-labelledby="settings-title">
+      <form method="dialog" class="sheet-inner">
+        <header class="sheet-head">
+          <h2 id="settings-title"></h2>
+          <button class="icon-btn" value="close" id="settings-close">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5.5 5.5l9 9M14.5 5.5l-9 9" /></svg>
+          </button>
+        </header>
+        <div class="sheet-body" id="settings-body"></div>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

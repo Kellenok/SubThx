@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>subthx API</title>
+    <style>
+      :root {
+        --paper: #f6f4ef;
+        --card: #ffffff;
+        --well: #efece5;
+        --ink: #1c1b19;
+        --ink-2: rgba(28, 27, 25, 0.7);
+        --ink-3: rgba(28, 27, 25, 0.5);
+        --ink-4: rgba(28, 27, 25, 0.3);
+        --rule: rgba(28, 27, 25, 0.08);
+        --seal: #d0402b;
+        --seal-wash: rgba(208, 64, 43, 0.1);
+        --moss: #4f7d54;
+        --moss-wash: rgba(79, 125, 84, 0.12);
+        --indigo: #3e5f8a;
+        --indigo-wash: rgba(62, 95, 138, 0.12);
+        --code: #f1eee7;
+        --lift: 0 0 0 1px rgba(28, 27, 25, 0.06), 0 1px 2px -1px rgba(28, 27, 25, 0.08), 0 2px 6px rgba(28, 27, 25, 0.04);
+        --font: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Yu Gothic UI", sans-serif;
+        --display: "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, sans-serif;
+        --mono: "Cascadia Code", "SF Mono", Consolas, ui-monospace, monospace;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --paper: #161513;
+          --card: #1f1d1b;
+          --well: #121110;
+          --ink: #ece8e1;
+          --ink-2: rgba(236, 232, 225, 0.72);
+          --ink-3: rgba(236, 232, 225, 0.5);
+          --ink-4: rgba(236, 232, 225, 0.28);
+          --rule: rgba(236, 232, 225, 0.07);
+          --seal: #e0583f;
+          --seal-wash: rgba(224, 88, 63, 0.14);
+          --moss: #7fae84;
+          --moss-wash: rgba(127, 174, 132, 0.14);
+          --indigo: #8fb0dc;
+          --indigo-wash: rgba(143, 176, 220, 0.14);
+          --code: #141312;
+          --lift: 0 0 0 1px rgba(236, 232, 225, 0.08);
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--paper);
+        color: var(--ink);
+        font: 400 14px/1.55 var(--font);
+        -webkit-font-smoothing: antialiased;
+      }
+      ::-webkit-scrollbar { width: 12px; height: 12px; }
+      ::-webkit-scrollbar-thumb { border: 4px solid transparent; border-radius: 999px; background: var(--ink-4) padding-box; }
+      ::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+      a { color: inherit; }
+      code, pre { font-family: var(--mono); font-size: 12.5px; }
+      .layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); min-height: 100vh; }
+      nav {
+        position: sticky; top: 0; height: 100vh; overflow: auto;
+        padding: 24px 12px 24px 20px; border-right: 1px solid var(--rule);
+      }
+      .brand { display: flex; align-items: center; gap: 10px; padding: 0 8px 20px; font: 600 15px/1 var(--display); }
+      .seal { width: 20px; height: 20px; border-radius: 6px; background: var(--seal); display: grid; place-items: center; }
+      .seal::after { content: ""; width: 9px; height: 9px; border-radius: 2px; box-shadow: inset 0 0 0 1.5px #fff; }
+      .nav-group { margin-top: 16px; }
+      .nav-group h4 { margin: 0 0 4px; padding: 0 8px; font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3); }
+      .nav-link {
+        display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 7px;
+        text-decoration: none; color: var(--ink-2); font-size: 13px;
+      }
+      .nav-link:hover { background: var(--well); color: var(--ink); }
+      .nav-link .m { width: 42px; flex: none; }
+      main { padding: 32px 40px 80px; max-width: 980px; }
+      header.top h1 { margin: 0; font: 600 28px/1.2 var(--display); letter-spacing: -.02em; }
+      header.top p { margin: 8px 0 0; color: var(--ink-2); max-width: 640px; text-wrap: pretty; }
+      .base { display: inline-flex; align-items: center; gap: 8px; margin-top: 16px; padding: 6px 6px 6px 12px; border-radius: 10px; background: var(--card); box-shadow: var(--lift); }
+      .base code { color: var(--ink); }
+      .links { margin-top: 12px; font-size: 13px; color: var(--ink-3); }
+      .tag { margin-top: 48px; }
+      .tag > h2 { margin: 0; font: 600 20px/1.3 var(--display); letter-spacing: -.01em; }
+      .tag > p { margin: 4px 0 0; color: var(--ink-3); }
+      .op { margin-top: 16px; padding: 20px; border-radius: 12px; background: var(--card); box-shadow: var(--lift); scroll-margin-top: 16px; }
+      .op-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+      .m {
+        display: inline-block; padding: 2px 0; border-radius: 6px; text-align: center;
+        font: 600 11px/1.4 var(--mono); letter-spacing: .02em;
+      }
+      .op-head .m { width: 58px; padding: 3px 0; }
+      .m.get { background: var(--indigo-wash); color: var(--indigo); }
+      .m.post { background: var(--moss-wash); color: var(--moss); }
+      .m.delete { background: var(--seal-wash); color: var(--seal); }
+      .path { font: 500 14px/1.4 var(--mono); }
+      .summary { color: var(--ink-2); margin-left: auto; font-weight: 500; }
+      .desc { margin: 12px 0 0; color: var(--ink-2); text-wrap: pretty; }
+      .desc code, td code { padding: 1px 5px; border-radius: 4px; background: var(--well); }
+      h5 { margin: 20px 0 8px; font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3); }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      td { padding: 8px 12px 8px 0; border-top: 1px solid var(--rule); vertical-align: top; }
+      td:first-child { white-space: nowrap; width: 1%; }
+      .pname { font: 500 12.5px var(--mono); }
+      .ptype { color: var(--ink-3); font: 12px var(--mono); }
+      .req { color: var(--seal); font-size: 11px; margin-left: 4px; }
+      .code {
+        position: relative; margin: 0; padding: 12px 14px; border-radius: 8px;
+        background: var(--code); box-shadow: inset 0 0 0 1px var(--rule);
+        overflow: auto; max-height: 360px; white-space: pre; user-select: text;
+      }
+      .code .k { color: var(--indigo); }
+      .code .s { color: var(--moss); }
+      .code .n { color: var(--seal); }
+      .resp { display: flex; align-items: baseline; gap: 8px; margin: 10px 0 6px; font-size: 13px; }
+      .status { font: 600 12px var(--mono); }
+      .status.ok { color: var(--moss); }
+      .status.err { color: var(--seal); }
+      .tools { display: flex; gap: 8px; margin-top: 16px; }
+      button {
+        height: 30px; padding: 0 12px; border: 0; border-radius: 8px; cursor: pointer;
+        font: 500 13px var(--font); color: var(--ink); background: var(--well);
+        transition: background-color 150ms cubic-bezier(.23,1,.32,1), transform 120ms cubic-bezier(.23,1,.32,1);
+      }
+      button:hover { background: color-mix(in srgb, var(--well) 70%, var(--ink-4)); }
+      button:active { transform: scale(.97); }
+      button.primary { background: var(--ink); color: var(--paper); }
+      .out { margin-top: 12px; }
+      .out:empty { display: none; }
+      @media (max-width: 820px) {
+        .layout { grid-template-columns: minmax(0, 1fr); }
+        nav { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--rule); }
+        main { padding: 24px 16px 64px; }
+        .summary { margin-left: 0; width: 100%; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="layout">
+      <nav id="nav"><div class="brand"><span class="seal"></span>subthx API</div></nav>
+      <main id="main"></main>
+    </div>
+    <script type="module">
+      const BASE = location.origin;
+      const spec = await (await fetch("/openapi.json")).json();
+      const $ = (s) => document.querySelector(s);
+      const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+      const md = (s) => esc(s || "").replace(/`([^`]+)`/g, "<code>$1</code>");
+
+      function resolve(s) {
+        if (s?.$ref) return resolve(spec.components.schemas[s.$ref.split("/").pop()]);
+        return s || {};
+      }
+
+      // a minimal JSON highlighter for examples
+      function json(v) {
+        const text = typeof v === "string" ? v : JSON.stringify(v, null, 2);
+        return esc(text).replace(/(&quot;(?:[^&]|&(?!quot;))*?&quot;)(\s*:)?|\b(true|false|null)\b|(-?\d+\.?\d*(?:e[+-]?\d+)?)/g, (m, str, colon, lit, num) => {
+          if (str) return colon ? `<span class="k">${str}</span>${colon}` : `<span class="s">${str}</span>`;
+          if (lit) return `<span class="n">${lit}</span>`;
+          return `<span class="n">${num}</span>`;
+        });
+      }
+
+      function exampleFor(schema) {
+        schema = resolve(schema);
+        if (schema.example !== undefined) return schema.example;
+        if (schema.type === "object" && schema.properties) {
+          return Object.fromEntries(Object.entries(schema.properties).map(([k, v]) => [k, exampleFor(v)]));
+        }
+        if (schema.type === "array") return [exampleFor(schema.items)];
+        if (schema.oneOf) return exampleFor(schema.oneOf[0]);
+        if (schema.enum) return schema.enum[0];
+        if (schema.default !== undefined) return schema.default;
+        const t = Array.isArray(schema.type) ? schema.type[0] : schema.type;
+        return { string: "", number: 0, integer: 0, boolean: false }[t] ?? null;
+      }
+
+      function typeOf(s) {
+        s = resolve(s);
+        if (s.oneOf) return s.oneOf.map(typeOf).join(" | ");
+        if (s.enum) return s.enum.join(" | ");
+        if (s.type === "array") return `${typeOf(s.items)}[]`;
+        return Array.isArray(s.type) ? s.type.join(" | ") : s.type || "object";
+      }
+
+      function curl(method, path, op) {
+        const body = op.requestBody?.content?.["application/json"];
+        const multipart = op.requestBody?.content?.["multipart/form-data"];
+        let c = `curl`;
+        if (method !== "get") c += ` -X ${method.toUpperCase()}`;
+        c += ` "${BASE}${path}"`;
+        if (body) c += ` \\\n  -H "Content-Type: application/json" \\\n  -d '${JSON.stringify(body.example ?? exampleFor(body.schema))}'`;
+        if (multipart) c += ` \\\n  -F file=@audio.mp3 -F response_format=srt`;
+        return c;
+      }
+
+      const ops = [];
+      for (const [path, item] of Object.entries(spec.paths)) {
+        for (const [method, op] of Object.entries(item)) ops.push({ path, method, op, id: `${method}-${path.replace(/[^a-z0-9]+/gi, "-")}` });
+      }
+
+      // navigation
+      const nav = $("#nav");
+      for (const tag of spec.tags) {
+        const items = ops.filter((o) => o.op.tags?.[0] === tag.name);
+        nav.insertAdjacentHTML(
+          "beforeend",
+          `<div class="nav-group"><h4>${esc(tag.name)}</h4>${items
+            .map((o) => `<a class="nav-link" href="#${o.id}"><span class="m ${o.method}">${o.method.toUpperCase()}</span>${esc(o.op.summary)}</a>`)
+            .join("")}</div>`,
+        );
+      }
+
+      // content
+      const main = $("#main");
+      main.insertAdjacentHTML(
+        "beforeend",
+        `<header class="top"><h1>${esc(spec.info.title)}</h1><p>${md(spec.info.description)}</p>
+          <div class="base"><code>${esc(BASE)}</code><button data-copy="${esc(BASE)}">Copy</button></div>
+          <div class="links">Machine-readable: <a href="/openapi.json">/openapi.json</a> (Postman, Swagger, client generators)</div></header>`,
+      );
+      for (const tag of spec.tags) {
+        const sec = document.createElement("section");
+        sec.className = "tag";
+        sec.innerHTML = `<h2>${esc(tag.name)}</h2><p>${md(tag.description)}</p>`;
+        for (const { path, method, op, id } of ops.filter((o) => o.op.tags?.[0] === tag.name)) {
+          const params = op.parameters || [];
+          const body = op.requestBody?.content;
+          const bodyType = body && Object.keys(body)[0];
+          const bodySchema = body && resolve(body[bodyType].schema);
+          const runnable = method === "get" && !params.some((p) => p.in === "path") && !path.includes("events");
+          let html = `<div class="op-head"><span class="m ${method}">${method.toUpperCase()}</span><span class="path">${esc(path)}</span><span class="summary">${esc(op.summary)}</span></div>`;
+          if (op.description) html += `<p class="desc">${md(op.description)}</p>`;
+          if (params.length) {
+            html += `<h5>Parameters</h5><table>${params
+              .map((p) => `<tr><td><span class="pname">${esc(p.name)}</span>${p.required ? '<span class="req">required</span>' : ""}<br><span class="ptype">${esc(p.in)} · ${esc(typeOf(p.schema))}</span></td><td>${md(p.description)}</td></tr>`)
+              .join("")}</table>`;
+          }
+          if (bodySchema?.properties) {
+            const required = new Set(bodySchema.required || []);
+            html += `<h5>Body <span class="ptype">${esc(bodyType)}</span></h5><table>${Object.entries(bodySchema.properties)
+              .map(([k, v]) => `<tr><td><span class="pname">${esc(k)}</span>${required.has(k) ? '<span class="req">required</span>' : ""}<br><span class="ptype">${esc(typeOf(v))}${v.default !== undefined ? ` = ${esc(JSON.stringify(v.default))}` : ""}</span></td><td>${md(v.description)}</td></tr>`)
+              .join("")}</table>`;
+          }
+          html += `<h5>Example</h5><pre class="code">${esc(curl(method, path, op))}</pre>`;
+          html += `<h5>Responses</h5>`;
+          for (const [code, r] of Object.entries(op.responses || {})) {
+            const content = r.content || {};
+            const jsonC = content["application/json"];
+            const ex = jsonC?.example ?? (jsonC?.schema ? exampleFor(jsonC.schema) : null);
+            html += `<div class="resp"><span class="status ${code < 300 ? "ok" : "err"}">${code}</span><span>${md(r.description)}</span></div>`;
+            if (ex !== null && ex !== undefined) html += `<pre class="code">${json(ex)}</pre>`;
+          }
+          html += `<div class="tools"><button data-copy="${esc(curl(method, path, op))}">Copy curl</button>${runnable ? `<button class="primary" data-run="${esc(path)}">Run</button>` : ""}</div><div class="out"></div>`;
+          const card = document.createElement("article");
+          card.className = "op";
+          card.id = id;
+          card.innerHTML = html;
+          sec.append(card);
+        }
+        main.append(sec);
+      }
+
+      document.addEventListener("click", async (e) => {
+        const b = e.target.closest("button");
+        if (!b) return;
+        if (b.dataset.copy) {
+          await navigator.clipboard.writeText(b.dataset.copy);
+          const t = b.textContent;
+          b.textContent = "Copied";
+          setTimeout(() => (b.textContent = t), 1200);
+        }
+        if (b.dataset.run) {
+          const out = b.closest(".op").querySelector(".out");
+          try {
+            const r = await fetch(b.dataset.run);
+            const text = await r.text();
+            let body;
+            try { body = json(JSON.parse(text)); } catch { body = esc(text); }
+            out.innerHTML = `<div class="resp"><span class="status ${r.ok ? "ok" : "err"}">${r.status}</span><span>live response</span></div><pre class="code">${body}</pre>`;
+          } catch (err) {
+            out.innerHTML = `<pre class="code">${esc(err.message)}</pre>`;
+          }
+        }
+      });
+      if (location.hash) document.querySelector(location.hash)?.scrollIntoView();
+    </script>
+  </body>
+</html>

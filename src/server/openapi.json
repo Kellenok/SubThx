@@ -1,0 +1,204 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "subthx API",
+    "version": "0.1.0",
+    "description": "Audiobook subtitles: sync a recording with its book text, or transcribe speech. One worker keeps the models loaded and runs jobs in order; the API queues jobs and reports on them. Paths in requests are files on the machine running the server."
+  },
+  "tags": [
+    { "name": "Jobs", "description": "Queue sync/gen jobs, follow their progress, fetch subtitles." },
+    { "name": "Models", "description": "What is installed and loaded; switch or free the model." },
+    { "name": "OpenAI", "description": "Drop-in for programs that speak the Whisper API." },
+    { "name": "Server", "description": "Health and helpers." }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearer": { "type": "http", "scheme": "bearer", "description": "Only when the server runs with --token." }
+    },
+    "schemas": {
+      "JobRequest": {
+        "type": "object",
+        "required": ["audio"],
+        "properties": {
+          "mode": { "type": "string", "enum": ["sync", "gen"], "default": "sync", "description": "sync: align with the book; gen: subtitles from speech only." },
+          "audio": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }], "description": "Audio or video file path(s) in reading order: m4b, m4a, mp3, flac, wav, ogg, aiff, mp4, mov, mkv, webm; with ffmpeg installed also opus, wma, avi, ts and others." },
+          "text": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }], "description": "Book: epub, txt, srt, vtt or ass path(s); a video stands for its embedded text subtitles in the job's language. Required for sync." },
+          "language": { "type": "string", "example": "ja", "description": "Subtitle language (ISO 639-1). The loaded model must support it." },
+          "write": { "type": "boolean", "default": false, "description": "Also write subtitle files, next to the audio or in output_dir." },
+          "output_dir": { "type": "string" },
+          "lang_ext": { "type": "string", "example": "ja", "description": "File names become <audio>.<lang_ext>.<format>." },
+          "format": { "type": "string", "enum": ["srt", "vtt"], "default": "srt", "description": "Format of written files." },
+          "overwrite": { "type": "boolean", "default": false, "description": "Replace existing files; the previous one is kept as .old." },
+          "respect_grouping": { "type": "boolean", "default": false, "description": "Regroup cues into whole sentences of the book (single text source)." },
+          "respect_grouping_count": { "type": "integer", "default": 6, "description": "Search depth for respect_grouping; 15 suits subtitles with songs." }
+        }
+      },
+      "Status": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "mode": { "type": "string", "enum": ["sync", "gen"] },
+          "state": { "type": "string", "enum": ["queued", "loading", "decoding", "vad", "asr", "aligning", "done", "failed", "cancelled"] },
+          "progress": { "type": "number", "description": "0..1 over the whole job." },
+          "file": { "type": "integer", "description": "Audio file being processed (0-based)." },
+          "files": { "type": "integer" },
+          "queued_ahead": { "type": "integer", "description": "Jobs before this one (while queued)." },
+          "error": { "type": "string" },
+          "written": { "type": "array", "items": { "type": "string" }, "description": "Subtitle files written (with write: true)." },
+          "elapsed": { "type": "number", "description": "Seconds since the job was queued." },
+          "took": { "type": "number", "description": "Processing seconds without the queue wait (when finished)." }
+        },
+        "example": { "id": "860816cc5b6e472fb0b69af71fc5b661", "mode": "sync", "state": "asr", "progress": 0.48, "file": 0, "files": 2, "elapsed": 4.5 }
+      },
+      "Segment": {
+        "type": "object",
+        "properties": { "text": { "type": "string" }, "start": { "type": "number" }, "end": { "type": "number" } }
+      },
+      "JobResult": {
+        "type": "object",
+        "properties": {
+          "files": { "type": "array", "items": { "type": "object", "properties": { "audio": { "type": "string" }, "segments": { "type": "array", "items": { "$ref": "#/components/schemas/Segment" } } } } },
+          "matches": { "type": "array", "items": { "type": "object", "properties": { "audio_file": { "type": "integer" }, "audio_chapter": { "type": "string" }, "text_chapter": { "type": ["string", "null"] }, "score": { "type": ["number", "null"] } } }, "description": "Which book chapter each audio chapter matched (sync)." },
+          "durations": { "type": "array", "items": { "type": "number" }, "description": "Audio length in seconds per file." },
+          "book_match": { "type": "number", "description": "Share of the matched book text that made it into the subtitles, 0..100 (sync)." },
+          "stages": { "type": "object", "description": "Seconds per stage.", "properties": { "load": { "type": "number" }, "decode": { "type": "number" }, "vad": { "type": "number" }, "asr": { "type": "number" }, "align": { "type": "number" }, "cached": { "type": "integer", "description": "Transcripts served from the cache." } } },
+          "model": { "type": "string" },
+          "device": { "type": "string" }
+        }
+      },
+      "Model": {
+        "type": "object",
+        "properties": {
+          "asr": { "type": "string" }, "device": { "type": "string" }, "loaded": { "type": "boolean" },
+          "load_seconds": { "type": ["number", "null"] }, "busy": { "type": ["string", "null"], "description": "Job the worker is running." }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": { "error": { "type": "object", "properties": { "message": { "type": "string" } } } },
+        "example": { "error": { "message": "sync needs \"text\": the book (epub/txt/srt/vtt/ass)" } }
+      }
+    }
+  },
+  "paths": {
+    "/v1/jobs": {
+      "post": {
+        "tags": ["Jobs"],
+        "summary": "Queue a job",
+        "description": "Returns 202 with the job status right away. With ?wait=true the request is held until the job finishes; add &format=srt|vtt|json to get the subtitles themselves.",
+        "parameters": [
+          { "name": "wait", "in": "query", "schema": { "type": "boolean" }, "description": "Hold the request until the job finishes." },
+          { "name": "format", "in": "query", "schema": { "type": "string", "enum": ["srt", "vtt", "json"] }, "description": "With wait: answer with the subtitles." },
+          { "name": "index", "in": "query", "schema": { "type": "integer", "default": 0 }, "description": "Which audio file's subtitles (several audio files)." }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobRequest" },
+            "example": { "mode": "sync", "audio": ["D:/books/part 1.m4a", "D:/books/part 2.m4a"], "text": "D:/books/book.epub", "language": "ja", "write": true, "lang_ext": "ja", "overwrite": true } } }
+        },
+        "responses": {
+          "202": { "description": "Queued", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Status" } } } },
+          "200": { "description": "Finished (wait=true)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Status" } }, "application/x-subrip": {} } },
+          "400": { "description": "Bad request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "403": { "description": "Path outside --allow-dir" }
+        }
+      },
+      "get": {
+        "tags": ["Jobs"],
+        "summary": "List jobs",
+        "description": "Every job the server remembers, oldest first. Finished jobs are forgotten after --keep-jobs minutes.",
+        "responses": { "200": { "description": "Jobs", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Status" } } } } } }
+      }
+    },
+    "/v1/jobs/{id}": {
+      "get": {
+        "tags": ["Jobs"],
+        "summary": "Job status",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Status", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Status" } } } }, "404": { "description": "No such job" } }
+      },
+      "delete": {
+        "tags": ["Jobs"],
+        "summary": "Cancel or forget a job",
+        "description": "A queued or running job is cancelled (a running one stops at the next batch); a finished one is removed.",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Status after the change", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Status" } } } } }
+      }
+    },
+    "/v1/jobs/{id}/events": {
+      "get": {
+        "tags": ["Jobs"],
+        "summary": "Progress stream (SSE)",
+        "description": "Server-sent events: one `data:` line with the Status JSON per change; the stream closes after the final state.",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "text/event-stream of Status", "content": { "text/event-stream": {} } } }
+      }
+    },
+    "/v1/jobs/{id}/result": {
+      "get": {
+        "tags": ["Jobs"],
+        "summary": "Subtitles of a finished job",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "format", "in": "query", "schema": { "type": "string", "enum": ["srt", "vtt", "json"], "default": "srt" } },
+          { "name": "index", "in": "query", "schema": { "type": "integer", "default": 0 }, "description": "Audio file (srt/vtt)." }
+        ],
+        "responses": {
+          "200": { "description": "SRT/VTT text, or the full result as JSON", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobResult" } }, "application/x-subrip": {}, "text/vtt": {} } },
+          "409": { "description": "Not finished, failed or cancelled", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v1/plan": {
+      "post": {
+        "tags": ["Jobs"],
+        "summary": "Sort dropped files into jobs",
+        "description": "The mode comes from what is there: a book makes sync; subtitles in the job's language (dropped, next to a video of the same name, or a video's embedded text track) are retimed; nothing makes gen. Subtitles subthx wrote itself (unchanged since) and `.old` backups are not taken as subtitles. Folders pair like `subthx sync -d`; loose audio files go with loose book files. Queue the returned jobs with POST /v1/jobs.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": { "paths": { "type": "array", "items": { "type": "string" } }, "language": { "type": "string", "description": "Subtitle language (ISO 639-1); default: the loaded model's first." } } }, "example": { "paths": ["D:/books/Tantei", "D:/clips/interview.mp3"] } } } },
+        "responses": { "200": { "description": "Planned jobs and warnings; `retime`: the texts are subtitles that keep their lines, `embedded`: they are the video's own track (the text is the video)", "content": { "application/json": { "example": { "jobs": [{ "mode": "sync", "retime": false, "embedded": false, "audio": ["D:/books/Tantei/part 1.m4a", "D:/books/Tantei/part 2.m4a"], "text": ["D:/books/Tantei/book.epub"] }, { "mode": "sync", "retime": true, "embedded": true, "audio": ["D:/anime/ep01.mkv"], "text": ["D:/anime/ep01.mkv"] }, { "mode": "gen", "retime": false, "embedded": false, "audio": ["D:/clips/interview.mp3"], "text": [] }], "warnings": [] } } } } }
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "tags": ["Models"],
+        "summary": "Model catalog",
+        "description": "Every model subthx knows with its languages, whether it is installed and its size on disk for the current device; the subtitle languages some model covers; the loaded model.",
+        "responses": { "200": { "description": "Catalog", "content": { "application/json": { "example": { "current": { "asr": "kitsune-p0.05b", "device": "cuda", "loaded": true, "load_seconds": 0.37, "busy": null }, "models": [{ "id": "kitsune-p0.05b", "name": "Kitsune 0.05B", "family": "kitsune", "languages": ["ja"], "installed": true, "size": 104555173 }], "languages": ["ja"], "devices": ["cuda", "directml", "cpu"] } } } } }
+      }
+    },
+    "/v1/models/load": {
+      "post": {
+        "tags": ["Models"],
+        "summary": "Load or switch the model",
+        "description": "Queued behind running jobs. Without a body it loads the current model.",
+        "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "asr": { "type": "string" }, "device": { "type": "string", "enum": ["cuda", "directml", "cpu"] }, "batch_size": { "type": "integer" } } }, "example": { "asr": "kitsune-p0.3b", "device": "cuda" } } } },
+        "responses": { "200": { "description": "Loaded", "content": { "application/json": { "example": { "model": { "asr": "kitsune-p0.3b", "device": "cuda", "loaded": true, "load_seconds": 6.07, "busy": null }, "load_seconds": 6.07 } } } }, "500": { "description": "Load failed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } } }
+      }
+    },
+    "/v1/models/unload": {
+      "post": {
+        "tags": ["Models"],
+        "summary": "Free the model",
+        "description": "Releases video memory; the next job loads it again.",
+        "responses": { "200": { "description": "Unloaded", "content": { "application/json": { "schema": { "type": "object", "properties": { "model": { "$ref": "#/components/schemas/Model" } } } } } } }
+      }
+    },
+    "/v1/audio/transcriptions": {
+      "post": {
+        "tags": ["OpenAI"],
+        "summary": "Transcribe an uploaded file",
+        "description": "Same shape as OpenAI's endpoint. Runs gen with the loaded model; `model`, `language`, `prompt` and `temperature` are accepted and ignored. The upload is deleted when the job ends.",
+        "requestBody": { "required": true, "content": { "multipart/form-data": { "schema": { "type": "object", "required": ["file"], "properties": { "file": { "type": "string", "format": "binary" }, "model": { "type": "string" }, "response_format": { "type": "string", "enum": ["json", "text", "srt", "vtt", "verbose_json"], "default": "json" } } } } } },
+        "responses": { "200": { "description": "Transcript", "content": { "application/json": { "example": { "text": "クラスの大嫌いな女子と結婚することになった。" } }, "text/plain": {}, "application/x-subrip": {}, "text/vtt": {} } } }
+      }
+    },
+    "/v1/health": {
+      "get": {
+        "tags": ["Server"],
+        "summary": "Health",
+        "responses": { "200": { "description": "Server and model state", "content": { "application/json": { "example": { "status": "ok", "version": "0.1.0", "model": { "asr": "kitsune-p0.05b", "device": "cuda", "loaded": true, "load_seconds": 0.37, "busy": null }, "pending_jobs": 0 } } } } }
+      }
+    }
+  },
+  "security": [{}, { "bearer": [] }]
+}
