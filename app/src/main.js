@@ -1147,7 +1147,11 @@ async function pollModels() {
   clearTimeout(pollTimer);
   await refreshCatalog();
   renderModelMenu();
-  if (state.catalog.some((m) => m.download?.running)) pollTimer = setTimeout(pollModels, 500);
+  const running = state.catalog.some((m) => m.download?.running);
+  // the model failed to load because it was missing: load it now that its files are there
+  const current = state.catalog.find((m) => m.id === state.snap.settings.asr);
+  if (!running && state.loadError && current?.installed) loadModel();
+  if (running) pollTimer = setTimeout(pollModels, 500);
 }
 
 function renderSettings() {
