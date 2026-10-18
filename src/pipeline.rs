@@ -96,10 +96,10 @@ fn default_batch(device: Device) -> (usize, String) {
             Some(free) => (fit_batch(free, 1000, 55, 64), format!("{} MiB of video memory free", free / MIB)),
             None => (16, "video memory unknown".into()),
         },
-        // far smaller: about 0.5 GB + 8 MiB per utterance
+        // 1.3 GB + 80 MiB per utterance, and 32 is as fast as 64 (RTX 4070, 7.5 h book)
         Device::Cuda => match crate::sysmem::free_vram(true) {
-            Some(free) => (fit_batch(free, 500, 16, 64), format!("{} MiB of video memory free", free / MIB)),
-            None => (64, "video memory unknown".into()),
+            Some(free) => (fit_batch(free, 1300, 80, 32), format!("{} MiB of video memory free", free / MIB)),
+            None => (32, "video memory unknown".into()),
         },
         // 8 uses ~0.9 GB, 16 is 13% faster for 0.8 GB more and 32 is no faster
         Device::Cpu => match crate::sysmem::available_ram() {
@@ -465,5 +465,10 @@ mod batch_tests {
         assert_eq!(fit_batch(3 * GIB, 1000, 55, 64), 8);
         assert_eq!(fit_batch(GIB, 1000, 55, 64), 2);
         assert_eq!(fit_batch(0, 1000, 55, 64), 2);
+        // CUDA: 1300 MiB + 80 MiB per utterance, at most 32
+        assert_eq!(fit_batch(24 * GIB, 1300, 80, 32), 32);
+        assert_eq!(fit_batch(8 * GIB, 1300, 80, 32), 32);
+        assert_eq!(fit_batch(6 * GIB, 1300, 80, 32), 16);
+        assert_eq!(fit_batch(4 * GIB, 1300, 80, 32), 8);
     }
 }

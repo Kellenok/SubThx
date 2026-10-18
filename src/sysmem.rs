@@ -4,6 +4,9 @@
 /// With `nvidia` the NVIDIA adapter with the most memory is taken instead.
 #[cfg(windows)]
 pub fn free_vram(nvidia: bool) -> Option<u64> {
+    if let Some(mib) = std::env::var("SUBTHX_FREE_VRAM_MIB").ok().and_then(|v| v.parse::<u64>().ok()) {
+        return Some(mib << 20); // for trying what a smaller card would pick
+    }
     use windows::core::Interface;
     use windows::Win32::Graphics::Dxgi::*;
     unsafe {
@@ -40,7 +43,7 @@ pub fn free_vram(nvidia: bool) -> Option<u64> {
 
 #[cfg(not(windows))]
 pub fn free_vram(_nvidia: bool) -> Option<u64> {
-    None
+    std::env::var("SUBTHX_FREE_VRAM_MIB").ok().and_then(|v| v.parse::<u64>().ok()).map(|mib| mib << 20)
 }
 
 /// Physical memory the system can give to a program now, in bytes.

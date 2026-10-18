@@ -83,7 +83,7 @@ Decoded sound is kept as 16-bit samples, and past 30 minutes in a temporary file
 
 ## DirectML notes
 
-- **Batch size** is in the app's settings (Auto looks at the free video memory on a GPU, up to 64, and at the free RAM on the CPU, up to 16: on the test machine DirectML takes 1.8 GiB at 16, 2.7 GiB at 32 and 4.4 GiB at 64, and a 7.5 hour book takes 0.9 GB of RAM at 8 and 1.7 GB at 16. Whisper takes at most 4 windows on DirectML and 8 elsewhere). A smaller batch uses less memory and keeps Windows responsive; `--batch-size` sets it in the CLI.
+- **Batch size** is in the app's settings (Auto looks at the free video memory on a GPU and at the free RAM on the CPU. Video memory on the test machine, 7.5 hour book: DirectML 1.8 GiB at 16, 2.7 GiB at 32, 4.4 GiB at 64; CUDA 2.5 GiB at 16, 3.9 GiB at 32, 6.4 GiB at 64, with 32 as fast as 64, so CUDA stops at 32. On the CPU a book takes 0.9 GB of RAM at 8 and 1.7 GB at 16. `SUBTHX_FREE_VRAM_MIB` makes Auto believe in a smaller or larger card. Whisper takes at most 4 windows on DirectML and 8 elsewhere). A smaller batch uses less memory and keeps Windows responsive; `--batch-size` sets it in the CLI.
 - If Whisper's output is garbled on a GPU but fine on the CPU, these environment variables show which half is at fault: `SUBTHX_WHISPER_ENC=cpu` or `SUBTHX_WHISPER_DEC=cpu` runs the encoder or the decoder on the CPU, `SUBTHX_DML_OPT=0` turns off graph optimizations on DirectML.
 
 ## Compared with SubPlz
