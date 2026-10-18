@@ -21,6 +21,7 @@ pub mod server;
 pub mod service;
 pub mod shift;
 pub mod sync;
+pub mod sysmem;
 pub mod textsrc;
 pub mod vad;
 pub mod whisper;

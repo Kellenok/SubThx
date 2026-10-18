@@ -680,7 +680,7 @@ pub struct ModelArgs {
     /// model folder (FireRedVAD, mel filterbank, kitsune-*)
     #[arg(long, default_value = "models")]
     pub models: PathBuf,
-    /// utterances per ASR batch (default: 64 on CUDA, 16 on DirectML, 8 on the CPU)
+    /// utterances per ASR batch (default: chosen from the free video memory, or free memory on the CPU)
     #[arg(long)]
     pub batch_size: Option<usize>,
     /// folder with CUDA/cuDNN DLLs, added to the DLL search path

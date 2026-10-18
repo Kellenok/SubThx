@@ -73,14 +73,48 @@ fn whisper_batch(asked: usize, device: Device) -> usize {
     std::env::var("SUBTHX_WHISPER_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(asked.min(cap))
 }
 
-/// Utterances per ASR batch when none is asked for.
-fn default_batch(device: Device) -> usize {
+/// The largest power of two in 2..=max whose memory (`base` + `per` MiB per
+/// utterance) fits in 60% of `free` bytes: the rest is for the desktop and
+/// other programs.
+pub fn fit_batch(free: u64, base: u64, per: u64, max: usize) -> usize {
+    let usable = (free / (1 << 20) * 3 / 5).saturating_sub(base) / per;
+    let mut n = 2;
+    while n * 2 <= max && (n as u64 * 2) <= usable {
+        n *= 2;
+    }
+    n
+}
+
+/// Utterances per ASR batch when none is asked for: as many as the free memory
+/// of the device allows, at most the size where more stops being faster.
+/// Returns the batch and a note on what it was chosen from.
+fn default_batch(device: Device) -> (usize, String) {
+    const MIB: u64 = 1 << 20;
     match device {
-        // more than that does not speed the CPU up and costs memory
-        Device::Cpu => 8,
-        // the GPU is the desktop's too: a smaller batch keeps Windows responsive
-        Device::DirectMl => 16,
-        Device::Cuda => 64,
+        // Kitsune 0.05B on the RTX 4070: 1.0 GB + 55 MiB per utterance
+        Device::DirectMl => match crate::sysmem::free_vram(false) {
+            Some(free) => (fit_batch(free, 1000, 55, 64), format!("{} MiB of video memory free", free / MIB)),
+            None => (16, "video memory unknown".into()),
+        },
+        // far smaller: about 0.5 GB + 8 MiB per utterance
+        Device::Cuda => match crate::sysmem::free_vram(true) {
+            Some(free) => (fit_batch(free, 500, 16, 64), format!("{} MiB of video memory free", free / MIB)),
+            None => (64, "video memory unknown".into()),
+        },
+        // 8 uses ~0.9 GB, 16 is 13% faster for 0.8 GB more and 32 is no faster
+        Device::Cpu => match crate::sysmem::available_ram() {
+            Some(free) => {
+                let gib = free / (MIB * 1024);
+                let n = match gib {
+                    16.. => 16,
+                    4..16 => 8,
+                    3 => 4,
+                    _ => 2,
+                };
+                (n, format!("{gib} GiB of memory free"))
+            }
+            None => (8, "memory unknown".into()),
+        },
     }
 }
 
@@ -188,7 +222,7 @@ pub struct Config {
     pub device: Device,
     /// holds firered_vad*.onnx, firered_vad_cmvn.json, nemo80_fbanks.npy, kitsune-*/
     pub models: PathBuf,
-    /// utterances per ASR batch; None = 64 on CUDA, 16 on DirectML, 8 on the CPU
+    /// utterances per ASR batch; None = chosen from the free memory of the device
     pub batch_size: Option<usize>,
 }
 
@@ -291,7 +325,11 @@ impl Engine {
             asr,
             languages: model_info(&cfg.asr).languages,
             language: None,
-            batch_size: cfg.batch_size.unwrap_or_else(|| default_batch(cfg.device)),
+            batch_size: cfg.batch_size.unwrap_or_else(|| {
+                let (n, why) = default_batch(cfg.device);
+                eprintln!("batch size {n} ({why})");
+                n
+            }),
             device: cfg.device,
             load_seconds: t.elapsed().as_secs_f64(),
         })
@@ -411,5 +449,21 @@ impl Engine {
             })
             .collect();
         Ok((out, tm))
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::fit_batch;
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn batch_follows_free_video_memory() {
+        // DirectML: 1000 MiB + 55 MiB per utterance
+        assert_eq!(fit_batch(11 * GIB, 1000, 55, 64), 64);
+        assert_eq!(fit_batch(5 * GIB, 1000, 55, 64), 32); // a 6 GB card with the desktop on it
+        assert_eq!(fit_batch(3 * GIB, 1000, 55, 64), 8);
+        assert_eq!(fit_batch(GIB, 1000, 55, 64), 2);
+        assert_eq!(fit_batch(0, 1000, 55, 64), 2);
     }
 }

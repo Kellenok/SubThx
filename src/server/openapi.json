@@ -171,7 +171,7 @@
         "tags": ["Models"],
         "summary": "Load or switch the model",
         "description": "Queued behind running jobs. Without a body it loads the current model.",
-        "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "asr": { "type": "string" }, "device": { "type": "string", "enum": ["cuda", "directml", "cpu"] }, "batch_size": { "type": "integer", "description": "utterances per batch; 0 = the default for the device" } } }, "example": { "asr": "kitsune-p0.3b", "device": "cuda" } } } },
+        "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "asr": { "type": "string" }, "device": { "type": "string", "enum": ["cuda", "directml", "cpu"] }, "batch_size": { "type": "integer", "description": "utterances per batch; 0 = chosen from the free memory of the device" } } }, "example": { "asr": "kitsune-p0.3b", "device": "cuda" } } } },
         "responses": { "200": { "description": "Loaded", "content": { "application/json": { "example": { "model": { "asr": "kitsune-p0.3b", "device": "cuda", "loaded": true, "load_seconds": 6.07, "busy": null }, "load_seconds": 6.07 } } } }, "500": { "description": "Load failed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } } }
       }
     },

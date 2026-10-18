@@ -26,6 +26,9 @@ half = "2"
 ureq = { version = "3", default-features = false, features = ["native-tls"] }
 sha2 = "0.10"
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_System_SystemInformation"] }
+
 [profile.release]
 debug = 1
 
