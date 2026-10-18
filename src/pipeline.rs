@@ -76,7 +76,8 @@ fn whisper_batch(asked: usize, device: Device) -> usize {
 /// Utterances per ASR batch when none is asked for.
 fn default_batch(device: Device) -> usize {
     match device {
-        Device::Cpu => 16,
+        // more than that does not speed the CPU up and costs memory
+        Device::Cpu => 8,
         // the GPU is the desktop's too: a smaller batch keeps Windows responsive
         Device::DirectMl => 16,
         Device::Cuda => 64,
@@ -187,7 +188,7 @@ pub struct Config {
     pub device: Device,
     /// holds firered_vad*.onnx, firered_vad_cmvn.json, nemo80_fbanks.npy, kitsune-*/
     pub models: PathBuf,
-    /// utterances per ASR batch; None = 64 on GPUs, 16 on the CPU (less padding)
+    /// utterances per ASR batch; None = 64 on CUDA, 16 on DirectML, 8 on the CPU
     pub batch_size: Option<usize>,
 }
 

@@ -77,9 +77,13 @@ subthx.exe serve --models models --device cpu
 
 Other programs can then post jobs to it; `--device` is `cuda` by default.
 
+## Memory
+
+Decoded sound is kept as 16-bit samples, and past 30 minutes in a temporary file in the system's temp folder (115 MB per hour of audio, deleted when the program ends), so RAM does not grow with the length of a book. A 7.5 hour audiobook peaks at about 1 GB on the CPU.
+
 ## DirectML notes
 
-- **Batch size** is in the app's settings (Auto picks 16 on DirectML and the CPU, 64 on CUDA; Whisper takes at most 4 windows on DirectML and 8 elsewhere). A smaller batch uses less GPU memory and keeps Windows responsive; `--batch-size` does the same in the CLI.
+- **Batch size** is in the app's settings (Auto picks 8 on the CPU, 16 on DirectML, 64 on CUDA; Whisper takes at most 4 windows on DirectML and 8 elsewhere). A smaller batch uses less GPU memory and keeps Windows responsive; `--batch-size` does the same in the CLI.
 - If Whisper's output is garbled on a GPU but fine on the CPU, these environment variables show which half is at fault: `SUBTHX_WHISPER_ENC=cpu` or `SUBTHX_WHISPER_DEC=cpu` runs the encoder or the decoder on the CPU, `SUBTHX_DML_OPT=0` turns off graph optimizations on DirectML.
 
 ## Compared with SubPlz
