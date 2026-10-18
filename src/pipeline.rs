@@ -64,13 +64,22 @@ pub const CATALOG: &[ModelInfo] = &[
     ModelInfo { id: "whisper-thewhisper-large-v3-turbo", name: "TheWhisper Large v3 Turbo", family: "whisper", languages: THEWHISPER_LANGUAGES },
 ];
 
-/// 30 s windows per Whisper batch: 8 holds ~5 GB of GPU memory with the
-/// fused encoder at nearly the speed of 16 (SUBTHX_WHISPER_BATCH overrides).
-/// A DirectML GPU shares the desktop: its default is half of that, so a card
-/// with 6 GB does not spill into system memory.
-fn whisper_batch(asked: usize, device: Device) -> usize {
-    let cap = if device == Device::DirectMl { 4 } else { 8 };
-    std::env::var("SUBTHX_WHISPER_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(asked.min(cap))
+/// 30 s windows per Whisper batch: 8 is nearly the speed of 16 on the fused
+/// encoder (SUBTHX_WHISPER_BATCH overrides).
+fn whisper_batch(asked: usize, _device: Device) -> usize {
+    std::env::var("SUBTHX_WHISPER_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(asked.min(8))
+}
+
+/// Whisper windows per batch on DirectML from the video memory left once the
+/// model is loaded (RTX 4070, turbo: 2.9 GiB in all at 4, 3.9 at 8, a step costs
+/// the same whatever the size, so a bigger batch is faster: 19.5 s, 11.6 s, 8.2 s
+/// at 4, 8, 16 on 15 minutes).
+fn whisper_dml_batch(free: u64) -> usize {
+    match free >> 30 {
+        4.. => 8,
+        2..4 => 4,
+        _ => 2,
+    }
 }
 
 /// The largest power of two in 2..=max whose memory (`base` + `per` MiB per
@@ -327,7 +336,13 @@ impl Engine {
             languages: model_info(&cfg.asr).languages,
             language: None,
             batch_size: cfg.batch_size.unwrap_or_else(|| {
-                let (n, why) = default_batch(cfg.device);
+                let (mut n, mut why) = default_batch(cfg.device);
+                if cfg.device == Device::DirectMl && model_info(&cfg.asr).family == "whisper" {
+                    if let Some(free) = crate::sysmem::free_vram(false) {
+                        n = whisper_dml_batch(free);
+                        why = format!("{} MiB of video memory free", free >> 20);
+                    }
+                }
                 eprintln!("batch size {n} ({why})");
                 n
             }),
