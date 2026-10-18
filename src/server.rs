@@ -1127,8 +1127,9 @@ async fn models_load(State(app): State<Shared>, body: Option<Json<LoadRequest>>)
         if let Some(d) = r.device {
             cfg.device = d.parse().map_err(bad)?;
         }
-        if r.batch_size.is_some() {
-            cfg.batch_size = r.batch_size;
+        // 0: the model's default for the device
+        if let Some(n) = r.batch_size {
+            cfg.batch_size = (n > 0).then_some(n);
         }
     }
     let on_cuda = cfg.device == crate::vad::Device::Cuda;

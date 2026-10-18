@@ -66,8 +66,21 @@ pub const CATALOG: &[ModelInfo] = &[
 
 /// 30 s windows per Whisper batch: 8 holds ~5 GB of GPU memory with the
 /// fused encoder at nearly the speed of 16 (SUBTHX_WHISPER_BATCH overrides).
-fn whisper_batch(asked: usize) -> usize {
-    std::env::var("SUBTHX_WHISPER_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(asked.min(8))
+/// A DirectML GPU shares the desktop: its default is half of that, so a card
+/// with 6 GB does not spill into system memory.
+fn whisper_batch(asked: usize, device: Device) -> usize {
+    let cap = if device == Device::DirectMl { 4 } else { 8 };
+    std::env::var("SUBTHX_WHISPER_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(asked.min(cap))
+}
+
+/// Utterances per ASR batch when none is asked for.
+fn default_batch(device: Device) -> usize {
+    match device {
+        Device::Cpu => 16,
+        // the GPU is the desktop's too: a smaller batch keeps Windows responsive
+        Device::DirectMl => 16,
+        Device::Cuda => 64,
+    }
 }
 
 /// The files a Whisper export loads.
@@ -218,6 +231,7 @@ pub struct Engine {
     /// the language of the next transcription, when set (see `set_language`)
     language: Option<String>,
     batch_size: usize,
+    device: Device,
     /// seconds spent loading the models
     pub load_seconds: f64,
 }
@@ -276,7 +290,8 @@ impl Engine {
             asr,
             languages: model_info(&cfg.asr).languages,
             language: None,
-            batch_size: cfg.batch_size.unwrap_or(if cfg.device == Device::Cpu { 16 } else { 64 }),
+            batch_size: cfg.batch_size.unwrap_or_else(|| default_batch(cfg.device)),
+            device: cfg.device,
             load_seconds: t.elapsed().as_secs_f64(),
         })
     }
@@ -344,7 +359,7 @@ impl Engine {
             Asr::Kitsune(m) => with_chunks(m.transcribe_with(&wav, &chunks, self.batch_size, &mut on_batch)?),
             // an encoder-decoder: windows of 30 s, far heavier per item
             Asr::Whisper(m) => m
-                .transcribe_with(&wav, &chunks, whisper_batch(self.batch_size), &mut on_batch)?
+                .transcribe_with(&wav, &chunks, whisper_batch(self.batch_size, self.device), &mut on_batch)?
                 .into_iter()
                 .map(|u| (u.start, u.end, u.text))
                 .collect(),

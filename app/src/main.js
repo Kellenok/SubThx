@@ -25,6 +25,7 @@ const host = {
       settings: {
         asr: "kitsune-p0.05b",
         device: "cuda",
+        batch_size: null,
         format: "srt",
         lang_ext: "ja",
         overwrite: true,
@@ -239,12 +240,12 @@ function renderEngine() {
 
 async function loadModel() {
   if (!state.snap?.api) return;
-  const { asr, device } = state.snap.settings;
+  const { asr, device, batch_size } = state.snap.settings;
   state.loading = true;
   state.loadError = null;
   renderEngine();
   try {
-    await api("/v1/models/load", { method: "POST", body: { asr, device } });
+    await api("/v1/models/load", { method: "POST", body: { asr, device, batch_size: batch_size || 0 } });
   } catch (e) {
     state.loadError = e.message;
     toast(t("modelFailedToast", errorText(e.message)));
@@ -809,7 +810,7 @@ async function saveSettings(patch) {
   const prev = state.snap.settings;
   const next = { ...prev, ...patch };
   state.snap = await host.save(next);
-  if (next.asr !== prev.asr || next.device !== prev.device) {
+  if (next.asr !== prev.asr || next.device !== prev.device || next.batch_size !== prev.batch_size) {
     loadModel();
     // the file each model loads (and so its size) depends on the device
     if (next.device !== prev.device) refreshCatalog().then(() => $("#settings").open && renderSettings());
@@ -1174,6 +1175,16 @@ function renderSettings() {
         ),
         stackRow(t("model"), null, modelPicker()),
         row(t("device"), deviceHint(), seg("device", s.device, Object.entries(DEVICES), chooseDevice)),
+        row(
+          t("batch"),
+          t("batchHint"),
+          select(
+            t("batch"),
+            String(s.batch_size ?? 0),
+            [0, 1, 2, 4, 8, 16, 32, 64].map((n) => ({ value: String(n), label: n ? String(n) : t("batchAuto") })),
+            (v) => saveSettings({ batch_size: Number(v) || null }),
+          ),
+        ),
       ),
       group(
         t("groupSubs"),

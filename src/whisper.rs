@@ -182,7 +182,9 @@ pub struct Whisper {
     max_initial: i64,
     begin_suppress: Vec<i64>,
     median_width: usize,
-    device: Device,
+    /// where each session runs (both the model's device unless overridden, see `load`)
+    enc_device: Device,
+    dec_device: Device,
     /// seconds in (features, encoder, decoder, alignment)
     pub profile: [f64; 4],
 }
@@ -231,14 +233,28 @@ impl Whisper {
         // the decoder's tensors grow every step: its arena grows by
         // doubling; the encoder's shapes repeat, so it takes exactly what it
         // needs
-        let onnx = |f: &str, growing: bool| -> Result<Session, String> {
+        // SUBTHX_WHISPER_ENC / SUBTHX_WHISPER_DEC (cpu, cuda, directml) move one
+        // of the two sessions to another device: when a GPU's output is wrong
+        // this shows which half is at fault (and the decoder, four layers, is
+        // cheap on the CPU)
+        let pick = |var: &str| -> Result<Device, String> {
+            match std::env::var(var) {
+                Ok(v) if !v.trim().is_empty() => v.trim().parse().map_err(|e| format!("{var}: {e}")),
+                _ => Ok(device),
+            }
+        };
+        let (enc_device, dec_device) = (pick("SUBTHX_WHISPER_ENC")?, pick("SUBTHX_WHISPER_DEC")?);
+        if enc_device != device || dec_device != device {
+            eprintln!("whisper: encoder on {enc_device}, decoder on {dec_device}");
+        }
+        let onnx = |f: &str, growing: bool, on: Device| -> Result<Session, String> {
             let p = dir.join("onnx").join(f);
-            crate::vad::session_opts(&p, device, false, growing).map_err(|e| format!("{}: {e}", p.display()))
+            crate::vad::session_opts(&p, on, false, growing).map_err(|e| format!("{}: {e}", p.display()))
         };
         Ok(Whisper {
             mel: WhisperMel::load(&dir.join("mel_filters.npy"))?,
-            enc: onnx("encoder_kv_fp16.onnx", false)?,
-            dec: onnx("decoder_fp16.onnx", true)?,
+            enc: onnx("encoder_kv_fp16.onnx", false, enc_device)?,
+            dec: onnx("decoder_fp16.onnx", true, dec_device)?,
             layers: cfg["decoder_layers"].as_u64().unwrap_or(4) as usize,
             heads: cfg["decoder_attention_heads"].as_u64().unwrap_or(20) as usize,
             head_dim: (cfg["d_model"].as_u64().unwrap_or(1280) / cfg["decoder_attention_heads"].as_u64().unwrap_or(20)) as usize,
@@ -257,7 +273,8 @@ impl Whisper {
             max_initial: gen["max_initial_timestamp_index"].as_i64().unwrap_or(50),
             begin_suppress: gen["begin_suppress_tokens"].as_array().into_iter().flatten().filter_map(|v| v.as_i64()).collect(),
             median_width: cfg["median_filter_width"].as_u64().unwrap_or(7) as usize,
-            device,
+            enc_device,
+            dec_device,
             profile: [0.0; 4],
         })
     }
@@ -322,7 +339,7 @@ impl Whisper {
         align: bool,
         opts: Option<&ort::session::RunOptions>,
     ) -> Result<(DynValue, Vec<DynValue>, Option<DynValue>), String> {
-        let dev = Self::device_mem(self.device)?;
+        let dev = Self::device_mem(self.dec_device)?;
         let cpu = MemoryInfo::new(AllocationDevice::CPU, 0, AllocatorType::Device, MemoryType::CPUOutput).map_err(err)?;
         let ids = Tensor::from_array(([b, ids.len() / b], ids.to_vec())).map_err(err)?;
         let empty: Vec<DynValue> = match past {
@@ -423,11 +440,11 @@ impl Whisper {
     fn run_batch(&mut self, wins: &[Window], speech: &[f64], feats: Vec<f32>) -> Result<(Vec<Vec<i64>>, Vec<Vec<Word>>), String> {
         let b = wins.len();
         let n_mels = self.mel.n_mels();
-        let dev = Self::device_mem(self.device)?;
+        let dev = Self::device_mem(self.enc_device)?;
         // arenas give back what a run no longer holds: shapes change every
         // step (the caches grow by a token) and freed blocks never fit again
         let mut shrink = ort::session::RunOptions::new().map_err(err)?;
-        if self.device == Device::Cuda {
+        if self.enc_device == Device::Cuda || self.dec_device == Device::Cuda {
             shrink.set("memory.enable_memory_arena_shrinkage", "gpu:0").map_err(err)?;
         }
 

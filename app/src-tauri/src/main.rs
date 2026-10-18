@@ -15,6 +15,8 @@ use tauri::{Manager, State};
 struct Settings {
     asr: String,
     device: String,
+    /// utterances per ASR batch; None = the model's default for the device
+    batch_size: Option<usize>,
     format: String,
     lang_ext: String,
     overwrite: bool,
@@ -38,6 +40,7 @@ impl Default for Settings {
         Settings {
             asr: "kitsune-p0.05b".into(),
             device: default_device().into(),
+            batch_size: None,
             format: "srt".into(),
             lang_ext: "ja".into(),
             overwrite: true,
@@ -98,7 +101,7 @@ fn start_server(s: &Settings) -> Result<String, String> {
             asr: s.asr.parse()?,
             device: s.device.parse()?,
             models: s.models_dir.clone(),
-            batch_size: None,
+            batch_size: s.batch_size,
             cuda_dir: s.cuda_dir.clone(),
         },
         lazy: true,

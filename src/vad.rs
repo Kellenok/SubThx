@@ -227,7 +227,13 @@ pub fn session_opts(path: &Path, device: Device, tf32: bool, grow_by_doubling: b
             }])
             .map_err(e)?,
         Device::DirectMl => b
-            .with_memory_pattern(false)
+            // SUBTHX_DML_OPT=0: no graph rewriting, for a GPU whose driver computes a fused node wrongly
+            .with_optimization_level(if std::env::var("SUBTHX_DML_OPT").is_ok_and(|v| v.trim() == "0") {
+                ort::session::builder::GraphOptimizationLevel::Disable
+            } else {
+                ort::session::builder::GraphOptimizationLevel::All
+            })
+            .and_then(|b| b.with_memory_pattern(false))
             .and_then(|b| b.with_parallel_execution(false))
             .and_then(|b| b.with_execution_providers([DirectML::default().build().error_on_failure()]))
             .map_err(e)?,
