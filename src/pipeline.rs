@@ -335,7 +335,7 @@ impl Engine {
             asr,
             languages: model_info(&cfg.asr).languages,
             language: None,
-            batch_size: cfg.batch_size.unwrap_or_else(|| {
+            batch_size: cfg.batch_size.inspect(|n| eprintln!("batch size {n} (chosen)")).unwrap_or_else(|| {
                 let (mut n, mut why) = default_batch(cfg.device);
                 if cfg.device == Device::DirectMl && model_info(&cfg.asr).family == "whisper" {
                     if let Some(free) = crate::sysmem::free_vram(false) {
