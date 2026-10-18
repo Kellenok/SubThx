@@ -298,14 +298,25 @@ impl Model {
         let group = batch.max(1) * MODEL_CHUNK;
         let frames = Fbank::num_frames(audio.len());
         let mut out = Vec::with_capacity(frames);
-        let mut start = 0;
-        while start < frames {
-            let n = group.min(frames - start);
-            let x = audio.range(start * SHIFT, (start + n - 1) * SHIFT + WIN);
-            let feats = fbank.compute(&x, cmvn);
-            out.extend(self.probs(&feats)?);
-            start += n;
-        }
+        // the next group's features are computed while the model runs on the current one
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|sc| {
+            sc.spawn(move || {
+                let mut start = 0;
+                while start < frames {
+                    let n = group.min(frames - start);
+                    let x = audio.range(start * SHIFT, (start + n - 1) * SHIFT + WIN);
+                    if tx.send(fbank.compute(&x, cmvn)).is_err() {
+                        break;
+                    }
+                    start += n;
+                }
+            });
+            for feats in rx {
+                out.extend(self.probs(&feats)?);
+            }
+            Ok::<(), String>(())
+        })?;
         Ok(out)
     }
 }
