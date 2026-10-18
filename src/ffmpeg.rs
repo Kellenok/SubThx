@@ -2,6 +2,7 @@
 //! WMA, AVI, FLV, MPEG-TS…). Used only when an `ffmpeg` binary is found:
 //! `SUBTHX_FFMPEG` (`none` to turn it off), next to our executable, or on PATH.
 
+use crate::audio::Sample;
 use rayon::prelude::*;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -98,7 +99,9 @@ pub fn probe(path: &Path) -> Option<Result<Probe, String>> {
 }
 
 /// 16 kHz mono f32 of `[start, start+len)` seconds (whole file without `start`).
-fn run(bin: &Path, path: &Path, track: usize, span: Option<(f64, f64)>) -> Result<Vec<f32>, String> {
+/// `seconds`: about how much sound comes out (room is reserved for it, so the
+/// buffer never grows by copying: a book's samples are gigabytes).
+fn run<T: Sample>(bin: &Path, path: &Path, track: usize, span: Option<(f64, f64)>, seconds: Option<f64>) -> Result<Vec<T>, String> {
     let mut c = command(bin);
     c.args(["-hide_banner", "-loglevel", "error"]);
     // no -ss for the first piece: even `-ss 0` drops a leading frame of some codecs
@@ -111,15 +114,31 @@ fn run(bin: &Path, path: &Path, track: usize, span: Option<(f64, f64)>) -> Resul
     }
     c.args(["-map", &format!("0:a:{track}"), "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "pipe:1"]);
     let mut child = c.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("ffmpeg: {e}"))?;
-    let mut bytes = Vec::new();
-    child.stdout.take().unwrap().read_to_end(&mut bytes).map_err(|e| format!("ffmpeg: {e}"))?;
+    // converted block by block (ffmpeg's own s16 output resamples a little
+    // differently from its float output): reading it all as bytes first would
+    // hold the sound twice
+    let mut out: Vec<T> = Vec::with_capacity(seconds.map_or(0, |s| (s.max(0.0) * 16000.0) as usize + 16000));
+    let mut stdout = child.stdout.take().unwrap();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut carry = 0;
+    loop {
+        let n = stdout.read(&mut buf[carry..]).map_err(|e| format!("ffmpeg: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        let have = carry + n;
+        let whole = have / 4 * 4;
+        out.extend(buf[..whole].chunks_exact(4).map(|b| T::from_f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))));
+        buf.copy_within(whole..have, 0);
+        carry = have - whole;
+    }
     let mut err = String::new();
     child.stderr.take().unwrap().read_to_string(&mut err).ok();
     let status = child.wait().map_err(|e| format!("ffmpeg: {e}"))?;
     if !status.success() {
         return Err(format!("ffmpeg: {}", err.trim()));
     }
-    Ok(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
+    Ok(out)
 }
 
 /// Bytes per second above which a file holds more than sound (2 Mbit/s;
@@ -131,7 +150,7 @@ const MAX_AUDIO_RATE: f64 = 250_000.0;
 /// each piece starts a little early and is spliced where its overlap matches
 /// what came before; every non-final piece then has its exact length, so the
 /// timeline never drifts.
-pub fn decode_16k(path: &Path, langs: &[&str]) -> Result<Vec<f32>, String> {
+pub fn decode_16k<T: Sample>(path: &Path, langs: &[&str]) -> Result<Vec<T>, String> {
     const M: usize = 16000; // matched overlap
     const R: usize = 1600; // search range either way
     let bin = ffmpeg().ok_or("ffmpeg not found")?;
@@ -154,19 +173,19 @@ pub fn decode_16k(path: &Path, langs: &[&str]) -> Result<Vec<f32>, String> {
         _ => 1,
     };
     if pieces == 1 {
-        return run(bin, path, track, None);
+        return run::<T>(bin, path, track, None, duration);
     }
     let d = duration.unwrap();
     let bound = |i: usize| ((d * i as f64 / pieces as f64) * 16000.0).round() as usize;
-    let parts: Vec<Vec<f32>> = (0..pieces)
+    let parts: Vec<Vec<T>> = (0..pieces)
         .into_par_iter()
         .map(|i| {
             let s0 = if i == 0 { 0 } else { bound(i) - M - R };
             let len = if i + 1 == pieces { 1e9 } else { (bound(i + 1) + R - s0) as f64 / 16000.0 };
-            run(bin, path, track, Some((s0 as f64 / 16000.0, len)))
+            run::<T>(bin, path, track, Some((s0 as f64 / 16000.0, len)), Some(len.min(d - s0 as f64 / 16000.0)))
         })
         .collect::<Result<_, String>>()?;
-    let mut out: Vec<f32> = Vec::with_capacity(bound(pieces) + 16000);
+    let mut out: Vec<T> = Vec::with_capacity(bound(pieces) + 16000);
     for (i, part) in parts.into_iter().enumerate() {
         let skip = if i == 0 { 0 } else { (M + R) as i64 + splice_lag(&out[bound(i) - M..bound(i)], &part, R) };
         let rest = part.get(skip.max(0) as usize..).unwrap_or(&[]);
@@ -175,7 +194,7 @@ pub fn decode_16k(path: &Path, langs: &[&str]) -> Result<Vec<f32>, String> {
         } else {
             let n = bound(i + 1) - bound(i);
             out.extend_from_slice(&rest[..n.min(rest.len())]);
-            out.resize(bound(i + 1), 0.0);
+            out.resize(bound(i + 1), T::ZERO);
         }
     }
     Ok(out)
@@ -184,9 +203,9 @@ pub fn decode_16k(path: &Path, langs: &[&str]) -> Result<Vec<f32>, String> {
 /// How far `tail` (the last samples so far) sits in `part` from where it
 /// should (at `r`): the best normalized correlation within ±r; 0 when the
 /// overlap is too quiet or too unlike to tell.
-fn splice_lag(tail: &[f32], part: &[f32], r: usize) -> i64 {
+fn splice_lag<T: Sample>(tail: &[T], part: &[T], r: usize) -> i64 {
     let m = tail.len();
-    let e: f64 = tail.iter().map(|x| (*x as f64).powi(2)).sum();
+    let e: f64 = tail.iter().map(|x| (x.to_f32() as f64).powi(2)).sum();
     if e / (m as f64) < 1e-7 || part.len() < m + 2 * r {
         return 0;
     }
@@ -196,8 +215,8 @@ fn splice_lag(tail: &[f32], part: &[f32], r: usize) -> i64 {
         let w = &part[b0..b0 + m];
         let (mut xy, mut yy) = (0f64, 0f64);
         for (x, y) in tail.iter().zip(w) {
-            xy += *x as f64 * *y as f64;
-            yy += (*y as f64).powi(2);
+            xy += x.to_f32() as f64 * y.to_f32() as f64;
+            yy += (y.to_f32() as f64).powi(2);
         }
         let c = xy / (e * yy).sqrt().max(1e-12);
         if c > best.1 {

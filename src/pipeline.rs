@@ -328,15 +328,13 @@ impl Engine {
             Some(l) => vec![l.as_str()],
             None => self.languages.to_vec(),
         };
-        let wav = crate::audio::decode_16k_for(audio, &wanted)?;
+        let wav = crate::audio::decode_pcm_for(audio, &wanted)?;
         tm.decode = t.elapsed().as_secs_f64();
         tm.audio_seconds = wav.len() as f64 / 16000.0;
 
         progress(Stage::Vad, 0.0)?;
         let t = Instant::now();
-        let feats = self.fbank.compute(&wav, &self.cmvn);
-        let probs = self.vad.probs(&feats)?;
-        drop(feats);
+        let probs = self.vad.probs_audio(&wav, &self.fbank, &self.cmvn)?;
         let decisions = vad::PostConfig::default().process(&probs);
         let chunks: Vec<Chunk> = vad::segments_samples(&decisions, wav.len())
             .into_iter()

@@ -55,7 +55,7 @@ impl Kitsune {
 
     /// Transcribe `chunks`; features for the next batches are computed on the
     /// CPU while the GPU runs the current one.
-    pub fn transcribe(&mut self, audio: &[f32], chunks: &[Chunk], batch_size: usize) -> Result<Vec<String>, String> {
+    pub fn transcribe(&mut self, audio: &crate::audio::Pcm, chunks: &[Chunk], batch_size: usize) -> Result<Vec<String>, String> {
         self.transcribe_with(audio, chunks, batch_size, &mut |_| Ok(()))
     }
 
@@ -63,7 +63,7 @@ impl Kitsune {
     /// batch; an error from it stops the run.
     pub fn transcribe_with(
         &mut self,
-        audio: &[f32],
+        audio: &crate::audio::Pcm,
         chunks: &[Chunk],
         batch_size: usize,
         on_batch: &mut dyn FnMut(usize) -> Result<(), String>,
@@ -88,7 +88,8 @@ impl Kitsune {
             scope.spawn(move || {
                 for (bi, batch) in batches_ref.iter().enumerate() {
                     let t0 = std::time::Instant::now();
-                    let wavs: Vec<&[f32]> = batch.iter().map(|&i| &audio[chunks[i].start..chunks[i].end]).collect();
+                    let owned: Vec<Vec<f32>> = batch.iter().map(|&i| audio.range(chunks[i].start, chunks[i].end)).collect();
+                    let wavs: Vec<&[f32]> = owned.iter().map(|v| &v[..]).collect();
                     let (feats, lens, t) = mel.batch(&wavs, 16000);
                     if tx.send((bi, feats, lens, t, t0.elapsed().as_secs_f64())).is_err() {
                         return;

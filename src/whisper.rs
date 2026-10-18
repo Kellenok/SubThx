@@ -382,7 +382,7 @@ impl Whisper {
     /// edges.
     pub fn transcribe_with(
         &mut self,
-        audio: &[f32],
+        audio: &crate::audio::Pcm,
         chunks: &[Chunk],
         batch: usize,
         on_batch: &mut dyn FnMut(usize) -> Result<(), String>,
@@ -416,7 +416,7 @@ impl Whisper {
                         let c = &chunks[i];
                         let (a, b) = (c.start.max(w.w0), c.end.min(w.w0 + WINDOW).min(audio.len()));
                         if b > a {
-                            wav[a - w.w0..b - w.w0].copy_from_slice(&audio[a..b]);
+                            audio.copy_to(a, b, &mut wav[a - w.w0..b - w.w0]);
                         }
                     }
                     self.mel.features(&wav)

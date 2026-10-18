@@ -288,6 +288,28 @@ impl Model {
     }
 }
 
+impl Model {
+    /// `probs(&fbank.compute(audio, cmvn))` with the features made a group of
+    /// chunks at a time: the whole file's features are over 100 MB per hour
+    /// of audio. A frame's features depend on its 400 samples only and the
+    /// model sees independent chunks, so the result is the same.
+    pub fn probs_audio(&mut self, audio: &crate::audio::Pcm, fbank: &Fbank, cmvn: &Cmvn) -> Result<Vec<f32>, String> {
+        let batch = std::env::var("SUBTHX_VAD_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(self.batch);
+        let group = batch.max(1) * MODEL_CHUNK;
+        let frames = Fbank::num_frames(audio.len());
+        let mut out = Vec::with_capacity(frames);
+        let mut start = 0;
+        while start < frames {
+            let n = group.min(frames - start);
+            let x = audio.range(start * SHIFT, (start + n - 1) * SHIFT + WIN);
+            let feats = fbank.compute(&x, cmvn);
+            out.extend(self.probs(&feats)?);
+            start += n;
+        }
+        Ok(out)
+    }
+}
+
 /// FireRed `VadPostprocessor` with SubPlz's FireRedVadConfig.
 pub struct PostConfig {
     pub smooth_window_size: usize,

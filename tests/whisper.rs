@@ -26,6 +26,7 @@ fn features_match_transformers() {
 fn transcribes_a_window() {
     let device: Device = std::env::var("SUBTHX_DEVICE").unwrap_or_else(|_| "cuda".into()).parse().unwrap();
     let (_, audio) = read_f32(Path::new("fixtures/whisper/long_audio.npy")).unwrap();
+    let audio = subthx::audio::Pcm::from_f32(&audio);
     let mut w = Whisper::load(Path::new(MODEL), "ja", device).unwrap();
     let chunks = [Chunk { start: 0, end: audio.len() }];
     let t = std::time::Instant::now();

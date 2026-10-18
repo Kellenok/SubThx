@@ -14,6 +14,72 @@ use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDe
 use symphonia::core::packet::Packet;
 
 pub const OUT_RATE: u32 = 16000;
+
+/// A decoded sample: `f32` for tests and tools, `i16` for the pipeline. SubPlz
+/// hears 16-bit samples too (faster-whisper and ffmpeg hand it s16), and the
+/// hours of a book take half the memory.
+pub trait Sample: Copy + Send + Sync + 'static {
+    const ZERO: Self;
+    fn from_f32(x: f32) -> Self;
+    fn to_f32(self) -> f32;
+}
+
+impl Sample for f32 {
+    const ZERO: f32 = 0.0;
+    fn from_f32(x: f32) -> f32 {
+        x
+    }
+    fn to_f32(self) -> f32 {
+        self
+    }
+}
+
+impl Sample for i16 {
+    const ZERO: i16 = 0;
+    /// like libswresample: round to nearest even, clip
+    fn from_f32(x: f32) -> i16 {
+        (x * 32768.0).round_ties_even().clamp(-32768.0, 32767.0) as i16
+    }
+    fn to_f32(self) -> f32 {
+        self as f32 / 32768.0
+    }
+}
+
+/// 16 kHz mono sound as 16-bit samples: what a book's decoding is kept as
+/// (230 MB an hour as f32, half of that this way).
+#[derive(Default)]
+pub struct Pcm(pub Vec<i16>);
+
+impl Pcm {
+    pub fn from_f32(x: &[f32]) -> Pcm {
+        Pcm(x.iter().map(|&v| i16::from_f32(v)).collect())
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// samples `a..b` (cut at the end) as f32
+    pub fn range(&self, a: usize, b: usize) -> Vec<f32> {
+        let b = b.min(self.0.len());
+        self.0[a.min(b)..b].iter().map(|&s| s.to_f32()).collect()
+    }
+
+    /// samples `a..b` into `out` (which is `b - a` long)
+    pub fn copy_to(&self, a: usize, b: usize, out: &mut [f32]) {
+        for (o, &s) in out.iter_mut().zip(&self.0[a..b]) {
+            *o = s.to_f32();
+        }
+    }
+
+    pub fn to_f32(&self) -> Vec<f32> {
+        self.range(0, self.0.len())
+    }
+}
 /// cumulative CPU time spent resampling (all threads), for profiling
 pub static RESAMPLE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const AAC_FRAME: usize = 1024;
@@ -89,7 +155,7 @@ impl Resampler {
 
     /// Output samples `out_start..out_start+out.len()` given input `x` that
     /// starts at absolute input index `x_start` (missing samples are zero).
-    pub fn process(&self, x: &[f32], x_start: usize, out_start: usize, out: &mut [f32]) {
+    pub fn process<T: Sample>(&self, x: &[f32], x_start: usize, out_start: usize, out: &mut [T]) {
         let taps = 2 * self.half;
         for (o, y) in out.iter_mut().enumerate() {
             let j = out_start + o;
@@ -109,7 +175,7 @@ impl Resampler {
                     }
                 }
             }
-            *y = acc;
+            *y = T::from_f32(acc);
         }
     }
 }
@@ -280,7 +346,7 @@ impl symphonia::core::io::MediaSource for ReadAhead {
 /// MKV/WebM, MP4/MOV without AAC. Packets are demuxed in batches (a WAV of a
 /// whole audiobook does not fit in memory twice); each batch is decoded in
 /// parallel chunks with pre-roll and placed by the packets' timestamps.
-fn decode_any(path: &Path, langs: &[&str]) -> Result<Vec<f32>, String> {
+fn decode_any<T: Sample>(path: &Path, langs: &[&str]) -> Result<Vec<T>, String> {
     use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
@@ -328,7 +394,7 @@ fn decode_any(path: &Path, langs: &[&str]) -> Result<Vec<f32>, String> {
         pos: i64,
         packet: Packet,
     }
-    let mut out: Vec<f32> = Vec::new();
+    let mut out: Vec<T> = Vec::new();
     let mut pending: Vec<Pkt> = Vec::new();
     // index in `pending` of the first packet not yet output (earlier ones are pre-roll)
     let mut first = 0usize;
@@ -437,10 +503,10 @@ fn decode_any(path: &Path, langs: &[&str]) -> Result<Vec<f32>, String> {
         for (piece, &(p0, _)) in pieces.into_iter().zip(&chunks) {
             let o0 = out_pos(pending[p0].pos);
             if out.len() < o0 {
-                out.resize(o0, 0.0);
+                out.resize(o0, T::ZERO);
             }
             out.truncate(o0);
-            out.extend_from_slice(&piece);
+            out.extend(piece.iter().map(|&x| T::from_f32(x)));
         }
         let done = chunks.last().unwrap().1;
         // keep the pre-roll of what comes next
@@ -528,6 +594,15 @@ pub fn decode_16k(path: &Path) -> Result<Vec<f32>, String> {
 /// [`decode_16k`] of the audio track in one of `langs` (ISO 639-1) when a
 /// file has several (see [`pick_track`]).
 pub fn decode_16k_for(path: &Path, langs: &[&str]) -> Result<Vec<f32>, String> {
+    decode_samples(path, langs)
+}
+
+/// [`decode_16k_for`] kept as 16-bit samples: what the pipeline works on.
+pub fn decode_pcm_for(path: &Path, langs: &[&str]) -> Result<Pcm, String> {
+    decode_samples::<i16>(path, langs).map(Pcm)
+}
+
+fn decode_samples<T: Sample>(path: &Path, langs: &[&str]) -> Result<Vec<T>, String> {
     let mut head = [0u8; 8];
     {
         use std::io::Read;
@@ -543,9 +618,9 @@ pub fn decode_16k_for(path: &Path, langs: &[&str]) -> Result<Vec<f32>, String> {
         std::fs::File::open(path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut h)).is_ok() && &h[8..12] == b"AVI "
     };
     let fast = if &head[4..8] == b"ftyp" {
-        Some(decode_mp4_aac(path))
+        Some(decode_mp4_aac::<T>(path))
     } else if crate::media::is_mp3(&head) {
-        Some(decode_mp3(path))
+        Some(decode_mp3::<T>(path))
     } else {
         None
     };
@@ -554,7 +629,7 @@ pub fn decode_16k_for(path: &Path, langs: &[&str]) -> Result<Vec<f32>, String> {
         Some(Err(e)) => e,
         None => String::new(),
     };
-    let err = match if avi { Err("AVI needs ffmpeg".to_string()) } else { decode_any(path, langs) } {
+    let err = match if avi { Err("AVI needs ffmpeg".to_string()) } else { decode_any::<T>(path, langs) } {
         Ok(v) => return Ok(v),
         Err(e) if first_err.is_empty() => e,
         Err(e) => format!("{first_err}; {e}"),
@@ -565,9 +640,32 @@ pub fn decode_16k_for(path: &Path, langs: &[&str]) -> Result<Vec<f32>, String> {
     Err(format!("{}: {err} (installing ffmpeg adds Opus, AC-3, WMA, AVI and more)", path.display()))
 }
 
-fn decode_mp4_aac(path: &Path) -> Result<Vec<f32>, String> {
+/// Read exactly `buf.len()` bytes at `off`, without moving a shared cursor.
+fn read_at(f: &std::fs::File, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0;
+        while done < buf.len() {
+            let n = f.seek_read(&mut buf[done..], off + done as u64)?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            done += n;
+        }
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        f.read_exact_at(buf, off)
+    }
+}
+
+fn decode_mp4_aac<T: Sample>(path: &Path) -> Result<Vec<T>, String> {
     let info = crate::media::mp4_audio(path)?;
-    let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    // the packets are read as they are needed: a book is hundreds of MB
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let n_packets = info.packets.len();
     // the edit list's priming is cut like ffmpeg does; input index i is
     // decoded sample i + skip
@@ -590,10 +688,10 @@ fn decode_mp4_aac(path: &Path) -> Result<Vec<f32>, String> {
         .with_sample_rate(info.sample_rate)
         .with_extra_data(info.asc.clone().into_boxed_slice());
 
-    let mut out = vec![0f32; out_len];
-    let chunks: Vec<(usize, &mut [f32])> = {
+    let mut out = vec![T::ZERO; out_len];
+    let chunks: Vec<(usize, &mut [T])> = {
         let mut v = Vec::new();
-        let mut rest: &mut [f32] = &mut out;
+        let mut rest: &mut [T] = &mut out;
         let mut p0 = 0;
         while p0 < n_packets {
             let p1 = (p0 + chunk_packets).min(n_packets);
@@ -615,10 +713,31 @@ fn decode_mp4_aac(path: &Path) -> Result<Vec<f32>, String> {
             .map_err(|e| e.to_string())?;
         let mut mono = Vec::with_capacity((d1 - d0) * AAC_FRAME);
         let mut inter: Vec<f32> = Vec::new();
+        // one read for the chunk when its packets lie one after another
+        let span = {
+            let (first, last) = (info.packets[d0], info.packets[d1 - 1]);
+            let total: u64 = info.packets[d0..d1].iter().map(|&(_, s)| s as u64).sum();
+            (last.0 + last.1 as u64 - first.0 == total).then_some((first.0, total as usize))
+        };
+        let block = match span {
+            Some((off, len)) => {
+                let mut b = vec![0u8; len];
+                read_at(&file, off, &mut b).map_err(|e| e.to_string())?;
+                Some((off, b))
+            }
+            None => None,
+        };
         for p in d0..d1 {
             let (off, size) = info.packets[p];
-            let bytes = &data[off as usize..off as usize + size as usize];
-            let pkt = Packet::new(0, ((p * AAC_FRAME) as i64).into(), (AAC_FRAME as u64).into(), bytes.to_vec());
+            let bytes = match &block {
+                Some((o, b)) => b[(off - o) as usize..(off - o) as usize + size as usize].to_vec(),
+                None => {
+                    let mut b = vec![0u8; size as usize];
+                    read_at(&file, off, &mut b).map_err(|e| e.to_string())?;
+                    b
+                }
+            };
+            let pkt = Packet::new(0, ((p * AAC_FRAME) as i64).into(), (AAC_FRAME as u64).into(), bytes.into_boxed_slice());
             match dec.decode(&pkt) {
                 Ok(buf) => {
                     let ch = buf.num_planes().max(1);
@@ -652,12 +771,12 @@ fn decode_mp4_aac(path: &Path) -> Result<Vec<f32>, String> {
 /// in parallel chunks with pre-roll (bit reservoir + MDCT overlap). Encoder
 /// delay and padding from the LAME tag are trimmed like ffmpeg does
 /// (delay = enc_delay + 529).
-fn decode_mp3(path: &Path) -> Result<Vec<f32>, String> {
+fn decode_mp3<T: Sample>(path: &Path) -> Result<Vec<T>, String> {
     use symphonia::core::formats::{FormatOptions, FormatReader};
     use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 
-    let data = std::fs::read(path).map_err(|e| e.to_string())?;
-    let mss = MediaSourceStream::new(Box::new(std::io::Cursor::new(data)), MediaSourceStreamOptions::default());
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
     let mut reader = symphonia::default::formats::MpaReader::try_new(mss, FormatOptions::default()).map_err(|e| e.to_string())?;
     let track = reader.tracks().first().ok_or("mp3: no track")?.clone();
     let params = track
@@ -685,16 +804,16 @@ fn decode_mp3(path: &Path) -> Result<Vec<f32>, String> {
     let in_len = (n * frame).saturating_sub(delay + padding);
     let rs = Resampler::new(in_rate, OUT_RATE);
     let out_len = rs.out_len(in_len);
-    let mut out = vec![0f32; out_len];
+    let mut out = vec![T::ZERO; out_len];
 
     // output j belongs to the chunk whose input range [s0, s1) contains j*num/den
     let chunk_packets: usize = std::env::var("SUBTHX_MP3_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
     let pre: usize = std::env::var("SUBTHX_MP3_PRE").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
     let post = rs.half.div_ceil(frame) + 1;
     let out_pos = |s: usize| (s * rs.den).div_ceil(rs.num).min(out_len);
-    let mut chunks: Vec<(usize, usize, &mut [f32])> = Vec::new();
+    let mut chunks: Vec<(usize, usize, &mut [T])> = Vec::new();
     {
-        let mut rest: &mut [f32] = &mut out;
+        let mut rest: &mut [T] = &mut out;
         let mut p0 = 0;
         let mut o_prev = 0;
         while p0 < n {

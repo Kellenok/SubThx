@@ -28,6 +28,7 @@ fn kitsune_matches_torch() {
     let file = std::env::var("SUBTHX_KITSUNE_FILE").unwrap_or_else(|_| "model.fp32.onnx".into());
     let device: Device = std::env::var("SUBTHX_DEVICE").unwrap_or_else(|_| "cuda".into()).parse().unwrap();
     let (_, audio) = read_f32(Path::new("fixtures/tantei16k.npy")).unwrap();
+    let audio = subthx::audio::Pcm::from_f32(&audio);
     let segs: Segs = serde_json::from_str(&std::fs::read_to_string("fixtures/vad/segments.json").unwrap()).unwrap();
     let want: Want = serde_json::from_str(&std::fs::read_to_string(format!("fixtures/asr/tantei.kitsune-{size}.json")).unwrap()).unwrap();
     let limit: usize = std::env::var("SUBTHX_ASR_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);

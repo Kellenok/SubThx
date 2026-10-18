@@ -93,7 +93,7 @@ impl Parakeet {
     }
 
     /// Transcribe `chunks` of `audio`; returns one text per chunk (input order).
-    pub fn transcribe(&mut self, audio: &[f32], chunks: &[Chunk], batch_size: usize) -> Result<Vec<String>, String> {
+    pub fn transcribe(&mut self, audio: &crate::audio::Pcm, chunks: &[Chunk], batch_size: usize) -> Result<Vec<String>, String> {
         self.transcribe_with(audio, chunks, batch_size, &mut |_| Ok(()))
     }
 
@@ -101,7 +101,7 @@ impl Parakeet {
     /// batch; an error from it stops the run.
     pub fn transcribe_with(
         &mut self,
-        audio: &[f32],
+        audio: &crate::audio::Pcm,
         chunks: &[Chunk],
         batch_size: usize,
         on_batch: &mut dyn FnMut(usize) -> Result<(), String>,
@@ -121,11 +121,12 @@ impl Parakeet {
         Ok(texts)
     }
 
-    fn batch(&mut self, audio: &[f32], chunks: &[Chunk], idx: &[usize]) -> Result<Vec<String>, String> {
+    fn batch(&mut self, audio: &crate::audio::Pcm, chunks: &[Chunk], idx: &[usize]) -> Result<Vec<String>, String> {
         let b = idx.len();
         let t0 = std::time::Instant::now();
         let (feats, flens, fshape) = if let Some(mel) = &self.mel {
-            let wavs: Vec<&[f32]> = idx.iter().map(|&i| &audio[chunks[i].start..chunks[i].end]).collect();
+            let owned: Vec<Vec<f32>> = idx.iter().map(|&i| audio.range(chunks[i].start, chunks[i].end)).collect();
+            let wavs: Vec<&[f32]> = owned.iter().map(|v| &v[..]).collect();
             let pad = std::env::var("SUBTHX_PAD_SAMPLES").ok().and_then(|v| v.parse().ok()).unwrap_or(16000);
             let (f, l, t) = mel.batch(&wavs, pad);
             (f, l, vec![b, mel.n_mels(), t])
@@ -233,14 +234,14 @@ impl Parakeet {
         Ok(tokens.iter().map(|t| self.detokenize(t)).collect())
     }
 
-    fn onnx_features(&mut self, audio: &[f32], chunks: &[Chunk], idx: &[usize]) -> Result<(Vec<f32>, Vec<i64>, Vec<usize>), String> {
+    fn onnx_features(&mut self, audio: &crate::audio::Pcm, chunks: &[Chunk], idx: &[usize]) -> Result<(Vec<f32>, Vec<i64>, Vec<usize>), String> {
         let b = idx.len();
         let lens: Vec<i64> = idx.iter().map(|&i| (chunks[i].end - chunks[i].start) as i64).collect();
         let max_len = *lens.iter().max().unwrap() as usize;
         let mut wav = vec![0f32; b * max_len];
         for (k, &i) in idx.iter().enumerate() {
             let c = chunks[i];
-            wav[k * max_len..k * max_len + (c.end - c.start)].copy_from_slice(&audio[c.start..c.end]);
+            audio.copy_to(c.start, c.end, &mut wav[k * max_len..k * max_len + (c.end - c.start)]);
         }
         let pre = self.pre.as_mut().ok_or("no preprocessor")?;
         let pre_out = pre
