@@ -99,16 +99,44 @@ impl Pcm {
         match &self.store {
             Store::Mem(v) => v[a..b].to_vec(),
             Store::File(f) => {
-                let mut bytes = vec![0u8; (b - a) * 2];
-                read_at(f, a as u64 * 2, &mut bytes).expect("temporary audio file");
-                bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect()
+                let bytes = self.bytes(f, a, b);
+                if bytes.len() > 1 << 20 {
+                    bytes.par_chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect()
+                } else {
+                    bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect()
+                }
             }
         }
     }
 
-    /// samples `a..b` (cut at the end) as f32
+    fn bytes(&self, f: &std::fs::File, a: usize, b: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; (b - a) * 2];
+        read_at(f, a as u64 * 2, &mut bytes).expect("temporary audio file");
+        bytes
+    }
+
+    /// samples `a..b` (cut at the end) as f32; a long stretch is converted on all cores
     pub fn range(&self, a: usize, b: usize) -> Vec<f32> {
-        self.read(a, b).into_iter().map(dequantize).collect()
+        let b = b.min(self.len);
+        let a = a.min(b);
+        let conv = |x: &[i16]| -> Vec<f32> {
+            if x.len() > 1 << 19 {
+                x.par_iter().map(|&s| dequantize(s)).collect()
+            } else {
+                x.iter().map(|&s| dequantize(s)).collect()
+            }
+        };
+        match &self.store {
+            Store::Mem(v) => conv(&v[a..b]),
+            Store::File(f) => {
+                let bytes = self.bytes(f, a, b);
+                if bytes.len() > 1 << 20 {
+                    bytes.par_chunks_exact(2).map(|c| dequantize(i16::from_le_bytes([c[0], c[1]]))).collect()
+                } else {
+                    bytes.chunks_exact(2).map(|c| dequantize(i16::from_le_bytes([c[0], c[1]]))).collect()
+                }
+            }
+        }
     }
 
     /// samples `a..b` into `out` (which is `b - a` long)

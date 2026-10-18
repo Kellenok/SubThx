@@ -440,7 +440,9 @@ impl Whisper {
     fn run_batch(&mut self, wins: &[Window], speech: &[f64], feats: Vec<f32>) -> Result<(Vec<Vec<i64>>, Vec<Vec<Word>>), String> {
         let b = wins.len();
         let n_mels = self.mel.n_mels();
-        let dev = Self::device_mem(self.enc_device)?;
+        // the caches go where the decoder reads them; between two devices
+        // (a diagnosis, see `load`) they pass through host memory
+        let dev = Self::device_mem(if self.enc_device == self.dec_device { self.enc_device } else { Device::Cpu })?;
         // arenas give back what a run no longer holds: shapes change every
         // step (the caches grow by a token) and freed blocks never fit again
         let mut shrink = ort::session::RunOptions::new().map_err(err)?;
@@ -457,6 +459,9 @@ impl Whisper {
             bind.bind_output_to_device(n.as_str(), &dev).map_err(err)?;
         }
         let mut outs = self.enc.run_binding_with_options(&bind, &shrink).map_err(err)?;
+        // the caches are read by the decoder's session, which has its own queue
+        // on a DirectML GPU: without this it can read them before they are written
+        bind.synchronize_outputs().map_err(err)?;
         let cross: Vec<DynValue> = cross_names.iter().map(|n| outs.remove(n.as_str()).ok_or("encoder: no cache")).collect::<Result<_, _>>()?;
         drop(outs);
         drop(bind);
