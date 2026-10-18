@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "subthx API",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "description": "Audiobook subtitles: sync a recording with its book text, or transcribe speech. One worker keeps the models loaded and runs jobs in order; the API queues jobs and reports on them. Paths in requests are files on the machine running the server."
   },
   "tags": [
@@ -196,7 +196,7 @@
       "get": {
         "tags": ["Server"],
         "summary": "Health",
-        "responses": { "200": { "description": "Server and model state", "content": { "application/json": { "example": { "status": "ok", "version": "0.1.0", "model": { "asr": "kitsune-p0.05b", "device": "cuda", "loaded": true, "load_seconds": 0.37, "busy": null }, "pending_jobs": 0 } } } } }
+        "responses": { "200": { "description": "Server and model state", "content": { "application/json": { "example": { "status": "ok", "version": "0.1.1", "model": { "asr": "kitsune-p0.05b", "device": "cuda", "loaded": true, "load_seconds": 0.37, "busy": null }, "pending_jobs": 0 } } } } }
       }
     }
   },
