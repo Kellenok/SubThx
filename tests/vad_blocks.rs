@@ -40,4 +40,11 @@ fn blocks_give_the_whole_files_probs() {
     assert_eq!(whole.len(), blocks.len());
     assert!(whole.iter().zip(&blocks).all(|(a, b)| a.to_bits() == b.to_bits()), "probabilities differ");
     assert!(whole.iter().any(|&p| p > 0.5) && whole.iter().any(|&p| p < 0.5), "the test audio says nothing");
+    // a block of chunks at a time, as the pipeline does while the file decodes
+    let frames = Fbank::num_frames(pcm.len());
+    let mut pieces = Vec::new();
+    for f0 in (0..frames).step_by(30000) {
+        pieces.extend(model.probs_frames(&pcm, &fbank, &cmvn, f0, (f0 + 30000).min(frames)).unwrap());
+    }
+    assert!(whole.iter().zip(&pieces).all(|(a, b)| a.to_bits() == b.to_bits()) && pieces.len() == whole.len(), "probabilities differ by block");
 }

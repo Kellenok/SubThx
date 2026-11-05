@@ -16,6 +16,10 @@ const PREEMPH: f32 = 0.97;
 pub struct NemoMel {
     /// [257][n_mels], from onnx_asr fbanks.npz
     fbank: Vec<f32>,
+    /// per FFT bin: the mel bins with a non-zero weight (lo..hi); a bin feeds
+    /// two or three mels, so the other weights are skipped (adding p * 0 leaves
+    /// the sum as it is: the result does not change)
+    nonzero: Vec<(usize, usize)>,
     n_mels: usize,
     /// np.hanning(400) zero-padded to 512, centered
     window: Vec<f64>,
@@ -34,8 +38,19 @@ impl NemoMel {
             window[off + n] = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * n as f64 / (WIN - 1) as f64).cos();
         }
         let fft = RealFftPlanner::<f64>::new().plan_fft_forward(N_FFT);
+        let m = shape[1];
+        let nonzero = (0..N_FFT / 2 + 1)
+            .map(|k| {
+                let row = &fbank[k * m..(k + 1) * m];
+                match row.iter().position(|&b| b != 0.0) {
+                    Some(lo) => (lo, row.iter().rposition(|&b| b != 0.0).unwrap() + 1),
+                    None => (0, 0),
+                }
+            })
+            .collect();
         Ok(NemoMel {
             fbank,
+            nonzero,
             n_mels: shape[1],
             window,
             fft,
@@ -92,8 +107,9 @@ impl NemoMel {
                 if p == 0.0 {
                     continue;
                 }
-                let fb = &self.fbank[k * m..(k + 1) * m];
-                for (r, &b) in row.iter_mut().zip(fb) {
+                let (lo, hi) = self.nonzero[k];
+                let fb = &self.fbank[k * m + lo..k * m + hi];
+                for (r, &b) in row[lo..hi].iter_mut().zip(fb) {
                     *r += p * b;
                 }
             }
