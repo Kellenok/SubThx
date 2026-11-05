@@ -27,7 +27,7 @@ impl Kitsune {
     pub fn load(dir: &Path, model_file: &str, fbank: &Path, device: Device) -> Result<Kitsune, String> {
         let tok: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("tokenizer.json")).map_err(err)?).map_err(err)?;
-        let mut vocab = vec![String::new(); 0];
+        let mut vocab: Vec<String> = Vec::new();
         let mut put = |id: usize, s: &str| {
             if vocab.len() <= id {
                 vocab.resize(id + 1, String::new());

@@ -98,7 +98,11 @@ impl Fbank {
                     buf[WIN..].fill(0.0);
                     fft.process_with_scratch(buf, spec, scratch).unwrap();
                     for (p, c) in power.iter_mut().zip(spec.iter()) {
-                        let a = c.re.hypot(c.im);
+                        // |c| as f32 `hypot` (what torch's abs() gives) but
+                        // without a libm call per bin: the squares of two f32
+                        // are exact in f64, and on 3e8 random pairs the result
+                        // matched `f32::hypot` bit for bit
+                        let a = ((c.re as f64) * (c.re as f64) + (c.im as f64) * (c.im as f64)).sqrt() as f32;
                         *p = a * a;
                     }
                     for (b, (first, w)) in self.banks.iter().enumerate() {
@@ -245,6 +249,8 @@ pub struct Model {
     session: ort::session::Session,
     /// 30000-frame chunks per run: batching helps GPUs, hurts the CPU EP
     batch: usize,
+    /// seconds in (features, waiting for them, model), for SUBTHX_PROFILE
+    pub profile: [f64; 3],
 }
 
 impl Model {
@@ -252,6 +258,7 @@ impl Model {
         Ok(Model {
             session: session(path, device)?,
             batch: if device == Device::Cpu { 1 } else { 8 },
+            profile: [0.0; 3],
         })
     }
 
@@ -294,30 +301,57 @@ impl Model {
     /// of audio. A frame's features depend on its 400 samples only and the
     /// model sees independent chunks, so the result is the same.
     pub fn probs_audio(&mut self, audio: &crate::audio::Pcm, fbank: &Fbank, cmvn: &Cmvn) -> Result<Vec<f32>, String> {
+        self.probs_frames(audio, fbank, cmvn, 0, Fbank::num_frames(audio.len()))
+    }
+
+    /// Frames `f0..f1` of [`Model::probs_audio`]: `f0` on a 30000-frame chunk
+    /// boundary, so a file done a block at a time gives the same result.
+    pub fn probs_frames(&mut self, audio: &crate::audio::Pcm, fbank: &Fbank, cmvn: &Cmvn, f0: usize, f1: usize) -> Result<Vec<f32>, String> {
+        assert_eq!(f0 % MODEL_CHUNK, 0, "VAD blocks start on a chunk");
         let batch = std::env::var("SUBTHX_VAD_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(self.batch);
         let group = batch.max(1) * MODEL_CHUNK;
-        let frames = Fbank::num_frames(audio.len());
-        let mut out = Vec::with_capacity(frames);
+        let mut out = Vec::with_capacity(f1.saturating_sub(f0));
         // the next group's features are computed while the model runs on the current one
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<f32>, f64)>(1);
         std::thread::scope(|sc| {
             sc.spawn(move || {
-                let mut start = 0;
-                while start < frames {
-                    let n = group.min(frames - start);
+                let mut start = f0;
+                while start < f1 {
+                    let t = std::time::Instant::now();
+                    let n = group.min(f1 - start);
                     let x = audio.range(start * SHIFT, (start + n - 1) * SHIFT + WIN);
-                    if tx.send(fbank.compute(&x, cmvn)).is_err() {
+                    let feats = fbank.compute(&x, cmvn);
+                    if tx.send((feats, t.elapsed().as_secs_f64())).is_err() {
                         break;
                     }
                     start += n;
                 }
             });
-            for feats in rx {
+            loop {
+                let t = std::time::Instant::now();
+                let Ok((feats, made)) = rx.recv() else { break };
+                self.profile[0] += made;
+                self.profile[1] += t.elapsed().as_secs_f64();
+                let t = std::time::Instant::now();
                 out.extend(self.probs(&feats)?);
+                self.profile[2] += t.elapsed().as_secs_f64();
             }
             Ok::<(), String>(())
         })?;
         Ok(out)
+    }
+}
+
+/// Frames per block of a file decoded and recognized a block at a time: 8
+/// model chunks (what one VAD run takes on a GPU), 40 minutes.
+pub const BLOCK_FRAMES: usize = 8 * MODEL_CHUNK;
+
+/// Samples a block of frames `f0..f1` reads.
+pub fn frames_samples(f1: usize) -> usize {
+    if f1 == 0 {
+        0
+    } else {
+        (f1 - 1) * SHIFT + WIN
     }
 }
 
@@ -351,8 +385,23 @@ pub fn round3(x: f64) -> f64 {
 
 impl PostConfig {
     pub fn process(&self, raw: &[f32]) -> Vec<u8> {
+        self.process_settled(raw).0
+    }
+
+    /// [`PostConfig::process`] of the start of a file's probabilities, and
+    /// the frame up to which its segments are settled: a segment that ends at
+    /// or before it comes out the same however the file goes on.
+    ///
+    /// Smoothing and the state machine look back only, except that speech is
+    /// filled back to its start once it lasts `min_speech_frame` frames and
+    /// `fix_smooth_window_start` reaches `smooth_window_size` frames before
+    /// an onset: frames up to those two before the end are as they will be.
+    /// A silence there of `merge_silence_frame` frames or more is never
+    /// merged away, so the segments before it are final (with their split
+    /// points, which only look inside a segment).
+    pub fn process_settled(&self, raw: &[f32]) -> (Vec<u8>, usize) {
         if raw.is_empty() {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
         let probs: Vec<f64> = raw.iter().map(|&p| p as f64).collect();
         let w = self.smooth_window_size.max(1);
@@ -374,7 +423,29 @@ impl PostConfig {
         let decisions = self.state_machine(&binary);
         let fixed = self.fix_smooth_window_start(&decisions);
         let merged = self.merge_short_silence(&fixed);
-        self.split_long_speech(&merged, &probs)
+        let settled = self.settled(&merged);
+        (self.split_long_speech(&merged, &probs), settled)
+    }
+
+    /// the start of the last long enough silence among the frames that will not change
+    fn settled(&self, merged: &[u8]) -> usize {
+        let sure = merged.len().saturating_sub(self.min_speech_frame + self.smooth_window_size + 1);
+        let need = self.merge_silence_frame.max(1);
+        let (mut settled, mut run_start, mut run) = (0, 0, 0);
+        for (t, &d) in merged.iter().enumerate().take(sure) {
+            if d == 0 {
+                if run == 0 {
+                    run_start = t;
+                }
+                run += 1;
+                if run == need {
+                    settled = run_start;
+                }
+            } else {
+                run = 0;
+            }
+        }
+        settled
     }
 
     fn state_machine(&self, binary: &[bool]) -> Vec<u8> {
@@ -530,4 +601,60 @@ pub fn segments_samples(decisions: &[u8], n_samples: usize) -> Vec<(usize, usize
         .into_iter()
         .map(|(s, e)| ((s * SAMPLE_RATE as f64) as usize, (e * SAMPLE_RATE as f64) as usize))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// probabilities of speech and pauses of every length (long speech that
+    /// gets split, pauses shorter than a merge)
+    fn probs(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed;
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut out = Vec::with_capacity(n);
+        let mut speech = false;
+        while out.len() < n {
+            let len = match rnd() % 6 {
+                0 => 1 + rnd() % 10,
+                1 => 10 + rnd() % 30,
+                2 => 30 + rnd() % 100,
+                3 => 100 + rnd() % 400,
+                4 => 800 + rnd() % 1500,
+                _ => 15 + rnd() % 10,
+            } as usize;
+            for _ in 0..len {
+                let noise = (rnd() % 1000) as f32 / 1000.0 * 0.5;
+                out.push(if speech { 0.5 + noise } else { noise * 0.9 });
+            }
+            speech = !speech;
+        }
+        out.truncate(n);
+        out
+    }
+
+    #[test]
+    fn settled_segments_do_not_change_later() {
+        let cfg = PostConfig::default();
+        for seed in 1..6u64 {
+            let p = probs(60_000, seed * 0x9E37_79B9);
+            let full = decision_to_segment(&cfg.process(&p), None);
+            let mut last = 0;
+            for end in (500..p.len()).step_by(997) {
+                let (d, settled) = cfg.process_settled(&p[..end]);
+                let cut = round3(settled as f64 * FRAME_SHIFT_S);
+                let segs: Vec<_> = decision_to_segment(&d, None).into_iter().filter(|s| s.1 <= cut).collect();
+                assert_eq!(segs[..], full[..segs.len()], "seed {seed}, first {end} frames");
+                assert!(settled >= last, "settled went back");
+                // it does not lag far behind
+                assert!(end - settled < 20_000, "seed {seed}: settled {settled} of {end}");
+                last = settled;
+            }
+        }
+    }
 }

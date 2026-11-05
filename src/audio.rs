@@ -61,6 +61,8 @@ fn io(e: std::io::Error) -> String {
 enum Store {
     Mem(Vec<i16>),
     File(std::fs::File),
+    /// a sink that may still be decoding
+    Live(std::sync::Arc<Sink>),
 }
 
 /// 16 kHz mono sound as 16-bit samples: what a book's decoding is kept as
@@ -84,6 +86,12 @@ impl Pcm {
         Pcm::from_vec(x.iter().map(|&v| quantize(v)).collect())
     }
 
+    /// The first `len` samples of a sink that may still be decoding (they
+    /// must be final: see [`Sink::wait_ready`]).
+    pub fn live(sink: std::sync::Arc<Sink>, len: usize) -> Pcm {
+        Pcm { store: Store::Live(sink), len }
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -98,21 +106,9 @@ impl Pcm {
         let a = a.min(b);
         match &self.store {
             Store::Mem(v) => v[a..b].to_vec(),
-            Store::File(f) => {
-                let bytes = self.bytes(f, a, b);
-                if bytes.len() > 1 << 20 {
-                    bytes.par_chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect()
-                } else {
-                    bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect()
-                }
-            }
+            Store::Live(sink) => sink.read(a, b),
+            Store::File(f) => read_samples(f, a, b - a),
         }
-    }
-
-    fn bytes(&self, f: &std::fs::File, a: usize, b: usize) -> Vec<u8> {
-        let mut bytes = vec![0u8; (b - a) * 2];
-        read_at(f, a as u64 * 2, &mut bytes).expect("temporary audio file");
-        bytes
     }
 
     /// samples `a..b` (cut at the end) as f32; a long stretch is converted on all cores
@@ -128,14 +124,8 @@ impl Pcm {
         };
         match &self.store {
             Store::Mem(v) => conv(&v[a..b]),
-            Store::File(f) => {
-                let bytes = self.bytes(f, a, b);
-                if bytes.len() > 1 << 20 {
-                    bytes.par_chunks_exact(2).map(|c| dequantize(i16::from_le_bytes([c[0], c[1]]))).collect()
-                } else {
-                    bytes.chunks_exact(2).map(|c| dequantize(i16::from_le_bytes([c[0], c[1]]))).collect()
-                }
-            }
+            Store::Live(sink) => conv(&sink.read(a, b)),
+            Store::File(f) => conv(&read_samples(f, a, b - a)),
         }
     }
 
@@ -167,13 +157,29 @@ struct SinkInner {
     len: usize,
     /// in memory up to this many samples
     limit: usize,
+    /// samples `0..ready` are final: a reader may take them while the rest decodes
+    ready: usize,
+    /// finished pieces past `ready` (start -> end), see [`Sink::complete`]
+    pieces: std::collections::BTreeMap<usize, usize>,
+    state: SinkState,
+}
+
+#[derive(Clone, PartialEq)]
+enum SinkState {
+    Decoding,
+    Done,
+    Failed(String),
+    Cancelled,
 }
 
 /// Where a decoder puts its samples: a growing buffer (what `Vec` would be)
 /// that moves to a temporary file once it is longer than 30 minutes. The
-/// parallel decoders write their pieces at positions.
+/// parallel decoders write their pieces at positions, and say how far the
+/// sound is final ([`Sink::publish`], [`Sink::complete`]): recognition can
+/// read the start of a book ([`Pcm::live`]) while the rest is decoded.
 pub struct Sink {
     inner: std::sync::Mutex<SinkInner>,
+    changed: std::sync::Condvar,
 }
 
 impl Default for Sink {
@@ -182,6 +188,8 @@ impl Default for Sink {
     }
 }
 
+pub const CANCELLED: &str = "cancelled";
+
 impl Sink {
     pub fn new() -> Sink {
         Sink::with_limit(spill_limit())
@@ -189,7 +197,18 @@ impl Sink {
 
     /// in memory up to `limit` samples, in a temporary file beyond
     pub fn with_limit(limit: usize) -> Sink {
-        Sink { inner: std::sync::Mutex::new(SinkInner { mem: Vec::new(), file: None, len: 0, limit }) }
+        Sink {
+            inner: std::sync::Mutex::new(SinkInner {
+                mem: Vec::new(),
+                file: None,
+                len: 0,
+                limit,
+                ready: 0,
+                pieces: Default::default(),
+                state: SinkState::Decoding,
+            }),
+            changed: std::sync::Condvar::new(),
+        }
     }
 
     /// `len` samples of silence to write pieces into
@@ -207,15 +226,11 @@ impl Sink {
         self.len() == 0
     }
 
-    /// the buffer in a file from now on
-    fn spill(g: &mut SinkInner) -> Result<(), String> {
+    /// the buffer in a file from now on, `n` samples long
+    fn spill(g: &mut SinkInner, n: usize) -> Result<(), String> {
         let f = spill_file().map_err(io)?;
-        let mut off = 0u64;
-        for block in g.mem.chunks(1 << 22) {
-            let bytes: Vec<u8> = block.iter().flat_map(|s| s.to_le_bytes()).collect();
-            write_at(&f, off, &bytes).map_err(io)?;
-            off += bytes.len() as u64;
-        }
+        write_samples(&f, 0, &g.mem).map_err(io)?;
+        f.set_len(n as u64 * 2).map_err(io)?; // zero-filled
         g.mem = Vec::new();
         g.file = Some(f);
         Ok(())
@@ -227,13 +242,16 @@ impl Sink {
         }
         match &g.file {
             Some(f) => f.set_len(n as u64 * 2).map_err(io)?, // zero-filled
-            None => {
-                g.mem.resize(n, 0);
-                // no room for a file: it stays in memory
-                if n > g.limit && Sink::spill(g).is_err() {
+            // straight to a file: a book's length of silence is not made in
+            // memory (and written out) first
+            None if n > g.limit => {
+                if Sink::spill(g, n).is_err() {
+                    // no room for a file: it stays in memory
                     g.limit = usize::MAX;
+                    g.mem.resize(n, 0);
                 }
             }
+            None => g.mem.resize(n, 0),
         }
         g.len = n;
         Ok(())
@@ -253,18 +271,19 @@ impl Sink {
                 None => g.mem.truncate(n),
             }
             g.len = n;
+            g.ready = g.ready.min(n);
         }
         Ok(())
     }
 
     pub fn write_at(&self, pos: usize, data: &[i16]) -> Result<(), String> {
         let mut g = self.inner.lock().unwrap();
+        if g.state == SinkState::Cancelled {
+            return Err(CANCELLED.into());
+        }
         Sink::grow(&mut g, pos + data.len())?;
         match &g.file {
-            Some(f) => {
-                let bytes: Vec<u8> = data.iter().flat_map(|s| s.to_le_bytes()).collect();
-                write_at(f, pos as u64 * 2, &bytes).map_err(io)
-            }
+            Some(f) => write_samples(f, pos, data).map_err(io),
             None => {
                 g.mem[pos..pos + data.len()].copy_from_slice(data);
                 Ok(())
@@ -276,6 +295,96 @@ impl Sink {
     pub fn extend(&self, data: &[i16]) -> Result<(), String> {
         let at = self.len();
         self.write_at(at, data)
+    }
+
+    /// samples `0..n` are final (a decoder that writes in order)
+    pub fn publish(&self, n: usize) {
+        let mut g = self.inner.lock().unwrap();
+        let n = n.min(g.len);
+        if n > g.ready {
+            g.ready = n;
+            self.changed.notify_all();
+        }
+    }
+
+    /// samples `a..b` are final (a decoder that writes pieces out of order):
+    /// the ready part grows as the pieces before it come in
+    pub fn complete(&self, a: usize, b: usize) {
+        let mut g = self.inner.lock().unwrap();
+        g.pieces.insert(a, b);
+        let before = g.ready;
+        loop {
+            let at = g.ready;
+            match g.pieces.remove(&at) {
+                Some(end) => g.ready = end.min(g.len),
+                None => break,
+            }
+        }
+        if g.ready != before {
+            self.changed.notify_all();
+        }
+    }
+
+    /// how far the samples are final
+    pub fn ready(&self) -> usize {
+        self.inner.lock().unwrap().ready
+    }
+
+    /// back to empty (a decoder that failed before it published anything)
+    pub fn reset(&self) -> Result<(), String> {
+        self.truncate(0)?;
+        self.inner.lock().unwrap().pieces.clear();
+        Ok(())
+    }
+
+    /// decoding is over: everything is final, or it failed with `res`
+    pub fn close(&self, res: Result<(), String>) {
+        let mut g = self.inner.lock().unwrap();
+        if g.state == SinkState::Decoding {
+            g.state = match res {
+                Ok(()) => SinkState::Done,
+                Err(e) => SinkState::Failed(e),
+            };
+        }
+        if g.state == SinkState::Done {
+            g.ready = g.len;
+        }
+        self.changed.notify_all();
+    }
+
+    /// stop the decoder: its next write fails
+    pub fn cancel(&self) {
+        let mut g = self.inner.lock().unwrap();
+        if g.state == SinkState::Decoding {
+            g.state = SinkState::Cancelled;
+        }
+        self.changed.notify_all();
+    }
+
+    /// Waits until `n` samples are final or decoding is over. Returns how
+    /// many samples are final and whether decoding is over (then all are).
+    pub fn wait_ready(&self, n: usize) -> Result<(usize, bool), String> {
+        let mut g = self.inner.lock().unwrap();
+        loop {
+            match &g.state {
+                SinkState::Failed(e) => return Err(e.clone()),
+                SinkState::Cancelled => return Err(CANCELLED.into()),
+                SinkState::Done => return Ok((g.len, true)),
+                SinkState::Decoding if g.ready >= n => return Ok((g.ready, false)),
+                SinkState::Decoding => g = self.changed.wait(g).unwrap(),
+            }
+        }
+    }
+
+    /// samples `a..b` (cut at the end), while the decoder may still write elsewhere
+    fn read(&self, a: usize, b: usize) -> Vec<i16> {
+        let g = self.inner.lock().unwrap();
+        let b = b.min(g.len);
+        let a = a.min(b);
+        match &g.file {
+            None => g.mem[a..b].to_vec(),
+            Some(f) => read_samples(f, a, b - a),
+        }
     }
 
     pub fn finish(self) -> Result<Pcm, String> {
@@ -359,28 +468,80 @@ impl Resampler {
     /// Output samples `out_start..out_start+out.len()` given input `x` that
     /// starts at absolute input index `x_start` (missing samples are zero).
     pub fn process(&self, x: &[f32], x_start: usize, out_start: usize, out: &mut [i16]) {
+        #[cfg(target_arch = "x86_64")]
+        if has_avx2() {
+            // SAFETY: the CPU supports AVX2 and FMA (checked above)
+            return unsafe { self.process_avx2(x, x_start, out_start, out) };
+        }
+        self.process_impl(x, x_start, out_start, out)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn process_avx2(&self, x: &[f32], x_start: usize, out_start: usize, out: &mut [i16]) {
+        self.process_impl(x, x_start, out_start, out)
+    }
+
+    /// Four outputs at a time where their taps lie inside `x`: each one is
+    /// summed in the same order as alone ([`dot_lanes`]), but the four sums
+    /// are independent, so the FMAs overlap instead of waiting on each other.
+    #[inline(always)]
+    fn process_impl(&self, x: &[f32], x_start: usize, out_start: usize, out: &mut [i16]) {
         let taps = 2 * self.half;
-        for (o, y) in out.iter_mut().enumerate() {
-            let j = out_start + o;
-            let pos = j * self.num;
-            let base = pos / self.den;
-            let ph = pos % self.den;
-            let h = &self.table[ph * taps..(ph + 1) * taps];
-            let first = base as isize - self.half as isize + 1 - x_start as isize;
-            let mut acc = 0f32;
-            if first >= 0 && first as usize + taps <= x.len() {
-                acc = dot(&x[first as usize..first as usize + taps], h);
+        // output j reads from input (j * num) / den with filter phase
+        // (j * num) % den; both are stepped instead of divided per output
+        let (step_base, step_ph) = (self.num / self.den, self.num % self.den);
+        let pos0 = out_start * self.num;
+        let mut base = pos0 / self.den;
+        let mut ph = pos0 % self.den;
+        let lead = self.half as isize - 1 + x_start as isize;
+        let mut next = || {
+            let r = (base as isize - lead, ph);
+            base += step_base;
+            ph += step_ph;
+            if ph >= self.den {
+                ph -= self.den;
+                base += 1;
+            }
+            r
+        };
+        let row = |ph: usize| &self.table[ph * taps..(ph + 1) * taps];
+        let inside = |first: isize| first >= 0 && first as usize + taps <= x.len();
+        let one = |first: isize, h: &[f32]| -> f32 {
+            if inside(first) {
+                dot_lanes(&x[first as usize..first as usize + taps], h)
             } else {
-                for k in 0..taps {
+                let mut acc = 0f32;
+                for (k, &hk) in h.iter().enumerate() {
                     let i = first + k as isize;
                     if i >= 0 && (i as usize) < x.len() {
-                        acc += x[i as usize] * h[k];
+                        acc += x[i as usize] * hk;
                     }
                 }
+                acc
             }
-            *y = quantize(acc);
+        };
+        for group in out.chunks_mut(4) {
+            let q: [(isize, usize); 4] = std::array::from_fn(|k| if k < group.len() { next() } else { (-1, 0) });
+            // first indices grow with the output: four are inside when the first and last are
+            if group.len() == 4 && inside(q[0].0) && inside(q[3].0) {
+                let s = dot_lanes4(q.map(|(f, _)| &x[f as usize..f as usize + taps]), q.map(|(_, p)| row(p)));
+                for (y, v) in group.iter_mut().zip(s) {
+                    *y = quantize(v);
+                }
+            } else {
+                for (y, &(f, p)) in group.iter_mut().zip(&q) {
+                    *y = quantize(one(f, row(p)));
+                }
+            }
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn has_avx2() -> bool {
+    static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVX2.get_or_init(|| is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"))
 }
 
 /// Dot product with 8 independent partial sums so it vectorises.
@@ -401,23 +562,64 @@ fn dot_lanes(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+/// One [`dot_lanes`], with FMA instructions when the CPU has them (the
+/// reference for the tests: what `process` did for every output).
+#[cfg(test)]
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn avx2(a: &[f32], b: &[f32]) -> f32 {
+        dot_lanes(a, b)
+    }
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        // SAFETY: the CPU supports AVX2 and FMA (checked above)
+        return unsafe { avx2(a, b) };
+    }
     dot_lanes(a, b)
 }
 
-#[inline]
-fn dot(a: &[f32], b: &[f32]) -> f32 {
+/// Four [`dot_lanes`] at once (slices of one length), each bit for bit the
+/// same as alone: lane `l` of sum `q` adds the same products in the same order.
+#[inline(always)]
+fn dot_lanes4(a: [&[f32]; 4], b: [&[f32]; 4]) -> [f32; 4] {
     #[cfg(target_arch = "x86_64")]
-    {
-        static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *AVX2.get_or_init(|| is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
-            // SAFETY: the CPU supports AVX2 and FMA (checked above)
-            return unsafe { dot_avx2(a, b) };
-        }
+    if has_avx2() {
+        // SAFETY: the CPU supports AVX2 and FMA (checked above)
+        return unsafe { dot4_avx2(a, b) };
     }
-    dot_lanes(a, b)
+    [0, 1, 2, 3].map(|q| dot_lanes(a[q], b[q]))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot4_avx2(a: [&[f32]; 4], b: [&[f32]; 4]) -> [f32; 4] {
+    use std::arch::x86_64::*;
+    let n = a[0].len();
+    assert!(a.iter().chain(&b).all(|v| v.len() == n));
+    let full = n / 8 * 8;
+    let mut acc = [_mm256_setzero_ps(); 4];
+    let mut i = 0;
+    while i < full {
+        for q in 0..4 {
+            // SAFETY: i + 8 <= full <= n, every slice is n long
+            let (x, y) = unsafe { (_mm256_loadu_ps(a[q].as_ptr().add(i)), _mm256_loadu_ps(b[q].as_ptr().add(i))) };
+            acc[q] = _mm256_fmadd_ps(x, y, acc[q]);
+        }
+        i += 8;
+    }
+    let mut out = [0f32; 4];
+    for q in 0..4 {
+        let mut c = [0f32; 8];
+        // SAFETY: c holds 8 floats
+        unsafe { _mm256_storeu_ps(c.as_mut_ptr(), acc[q]) };
+        let mut s = (c[0] + c[4]) + (c[1] + c[5]) + (c[2] + c[6]) + (c[3] + c[7]);
+        for k in full..n {
+            s += a[q][k] * b[q][k];
+        }
+        out[q] = s;
+    }
+    out
 }
 
 /// Everything else symphonia reads: FLAC, WAV, AIFF, CAF, Ogg Vorbis, ALAC,
@@ -549,7 +751,7 @@ impl symphonia::core::io::MediaSource for ReadAhead {
 /// MKV/WebM, MP4/MOV without AAC. Packets are demuxed in batches (a WAV of a
 /// whole audiobook does not fit in memory twice); each batch is decoded in
 /// parallel chunks with pre-roll and placed by the packets' timestamps.
-fn decode_any(path: &Path, langs: &[&str]) -> Result<Pcm, String> {
+fn decode_any(path: &Path, langs: &[&str], out: &Sink) -> Result<(), String> {
     use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
@@ -597,7 +799,6 @@ fn decode_any(path: &Path, langs: &[&str]) -> Result<Pcm, String> {
         pos: i64,
         packet: Packet,
     }
-    let out = Sink::new();
     let mut pending: Vec<Pkt> = Vec::new();
     // index in `pending` of the first packet not yet output (earlier ones are pre-roll)
     let mut first = 0usize;
@@ -711,6 +912,8 @@ fn decode_any(path: &Path, langs: &[&str]) -> Result<Pcm, String> {
             out.truncate(o0)?;
             out.extend(&piece)?;
         }
+        // the next batch starts where this one ended
+        out.publish(out.len());
         let done = chunks.last().unwrap().1;
         // keep the pre-roll of what comes next
         let keep_from = done.saturating_sub(PRE);
@@ -723,7 +926,7 @@ fn decode_any(path: &Path, langs: &[&str]) -> Result<Pcm, String> {
     if out.is_empty() {
         return Err("no audio decoded".into());
     }
-    out.finish()
+    Ok(())
 }
 
 /// ISO 639-2 codes (both forms) of the ISO 639-1 languages we transcribe.
@@ -804,6 +1007,17 @@ pub fn decode_16k_for(path: &Path, langs: &[&str]) -> Result<Vec<f32>, String> {
 /// [`decode_16k_for`] kept as 16-bit samples (in a temporary file when long):
 /// what the pipeline works on.
 pub fn decode_pcm_for(path: &Path, langs: &[&str]) -> Result<Pcm, String> {
+    let out = Sink::new();
+    decode_into(path, langs, &out)?;
+    out.finish()
+}
+
+/// [`decode_pcm_for`] into `out`, saying how far the sound is final as it
+/// goes ([`Sink::wait_ready`]); `out.close` is left to the caller. A decoder
+/// that fails before any of its sound is final gives way to the next one, as
+/// in [`decode_pcm_for`]; one that fails later fails the decoding (what was
+/// read from it may be in use).
+pub fn decode_into(path: &Path, langs: &[&str], out: &Sink) -> Result<(), String> {
     let mut head = [0u8; 8];
     {
         use std::io::Read;
@@ -818,27 +1032,92 @@ pub fn decode_pcm_for(path: &Path, langs: &[&str]) -> Result<Pcm, String> {
         let mut h = [0u8; 12];
         std::fs::File::open(path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut h)).is_ok() && &h[8..12] == b"AVI "
     };
+    // a decoder's error: the next one may try, unless its sound was used already
+    let failed = |e: String| -> Result<String, String> {
+        if out.ready() > 0 || e == CANCELLED {
+            return Err(format!("{}: {e}", path.display()));
+        }
+        out.reset()?;
+        Ok(e)
+    };
     let fast = if &head[4..8] == b"ftyp" {
-        Some(decode_mp4_aac(path))
+        Some(decode_mp4_aac(path, out))
     } else if crate::media::is_mp3(&head) {
-        Some(decode_mp3(path))
+        Some(decode_mp3(path, out))
     } else {
         None
     };
     let first_err = match fast {
-        Some(Ok(v)) => return Ok(v),
-        Some(Err(e)) => e,
+        Some(Ok(())) => return Ok(()),
+        Some(Err(e)) => failed(e)?,
         None => String::new(),
     };
-    let err = match if avi { Err("AVI needs ffmpeg".to_string()) } else { decode_any(path, langs) } {
-        Ok(v) => return Ok(v),
-        Err(e) if first_err.is_empty() => e,
-        Err(e) => format!("{first_err}; {e}"),
+    let err = match if avi { Err("AVI needs ffmpeg".to_string()) } else { decode_any(path, langs, out) } {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            let e = failed(e)?;
+            if first_err.is_empty() {
+                e
+            } else {
+                format!("{first_err}; {e}")
+            }
+        }
     };
     if crate::ffmpeg::ffmpeg().is_some() {
-        return crate::ffmpeg::decode_16k(path, langs).map(Pcm::from_vec).map_err(|e| format!("{}: {e}", path.display()));
+        let v = crate::ffmpeg::decode_16k(path, langs).map_err(|e| format!("{}: {e}", path.display()))?;
+        return out.extend(&v);
     }
     Err(format!("{}: {err} (installing ffmpeg adds Opus, AC-3, WMA, AVI and more)", path.display()))
+}
+
+/// The threads that decode while recognition runs: below normal priority, so
+/// the features for the model and the thread that feeds the GPU go first and
+/// decoding takes the CPU time left over.
+pub fn background_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("subthx-decode-{i}"))
+            .start_handler(|_| lower_thread_priority())
+            .build()
+            .expect("decoding threads")
+    })
+}
+
+fn lower_thread_priority() {
+    #[cfg(windows)]
+    // SAFETY: changes the priority of the calling thread only
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+/// `n` samples from sample `a` of a file of 16-bit little-endian samples,
+/// read straight into the samples (no buffer of bytes to convert).
+fn read_samples(f: &std::fs::File, a: usize, n: usize) -> Vec<i16> {
+    let mut v = vec![0i16; n];
+    // SAFETY: the bytes of the `n` samples; any bytes make a valid i16
+    let bytes = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), n * 2) };
+    read_at(f, a as u64 * 2, bytes).expect("temporary audio file");
+    if cfg!(target_endian = "big") {
+        for s in &mut v {
+            *s = i16::from_le(*s);
+        }
+    }
+    v
+}
+
+/// `data` as 16-bit little-endian samples at sample `a` of a file.
+fn write_samples(f: &std::fs::File, a: usize, data: &[i16]) -> std::io::Result<()> {
+    if cfg!(target_endian = "little") {
+        // SAFETY: the bytes of `data`, which is borrowed for the call
+        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data)) };
+        write_at(f, a as u64 * 2, bytes)
+    } else {
+        let bytes: Vec<u8> = data.iter().flat_map(|s| s.to_le_bytes()).collect();
+        write_at(f, a as u64 * 2, &bytes)
+    }
 }
 
 /// Read exactly `buf.len()` bytes at `off`, without moving a shared cursor.
@@ -885,7 +1164,7 @@ fn write_at(f: &std::fs::File, off: u64, buf: &[u8]) -> std::io::Result<()> {
     }
 }
 
-fn decode_mp4_aac(path: &Path) -> Result<Pcm, String> {
+fn decode_mp4_aac(path: &Path, out: &Sink) -> Result<(), String> {
     let info = crate::media::mp4_audio(path)?;
     // the packets are read as they are needed: a book is hundreds of MB
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
@@ -911,7 +1190,7 @@ fn decode_mp4_aac(path: &Path) -> Result<Pcm, String> {
         .with_sample_rate(info.sample_rate)
         .with_extra_data(info.asc.clone().into_boxed_slice());
 
-    let out = Sink::with_len(out_len)?;
+    out.resize(out_len)?;
     let chunks: Vec<(usize, usize)> = {
         let mut v = Vec::new();
         let mut p0 = 0;
@@ -925,7 +1204,8 @@ fn decode_mp4_aac(path: &Path) -> Result<Pcm, String> {
         v
     };
 
-    chunks.into_par_iter().try_for_each(|(p0, len)| -> Result<(), String> {
+    // taken in order (par_bridge), so the start of the book is ready first
+    chunks.into_iter().par_bridge().try_for_each(|(p0, len)| -> Result<(), String> {
         let mut dst = vec![0i16; len];
         let p1 = (p0 + chunk_packets).min(n_packets);
         let d0 = p0.saturating_sub(pre);
@@ -983,16 +1263,17 @@ fn decode_mp4_aac(path: &Path) -> Result<Pcm, String> {
             rs.process(&mono[((-x_start) as usize).min(mono.len())..], 0, o0, &mut dst);
         }
         RESAMPLE_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        out.write_at(o0, &dst)
-    })?;
-    out.finish()
+        out.write_at(o0, &dst)?;
+        out.complete(o0, o0 + len);
+        Ok(())
+    })
 }
 
 /// MP3: frames are parsed sequentially by symphonia's MPEG reader, then decoded
 /// in parallel chunks with pre-roll (bit reservoir + MDCT overlap). Encoder
 /// delay and padding from the LAME tag are trimmed like ffmpeg does
 /// (delay = enc_delay + 529).
-fn decode_mp3(path: &Path) -> Result<Pcm, String> {
+fn decode_mp3(path: &Path, out: &Sink) -> Result<(), String> {
     use symphonia::core::formats::{FormatOptions, FormatReader};
     use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 
@@ -1025,7 +1306,7 @@ fn decode_mp3(path: &Path) -> Result<Pcm, String> {
     let in_len = (n * frame).saturating_sub(delay + padding);
     let rs = Resampler::new(in_rate, OUT_RATE);
     let out_len = rs.out_len(in_len);
-    let out = Sink::with_len(out_len)?;
+    out.resize(out_len)?;
 
     // output j belongs to the chunk whose input range [s0, s1) contains j*num/den
     let chunk_packets: usize = std::env::var("SUBTHX_MP3_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
@@ -1045,7 +1326,8 @@ fn decode_mp3(path: &Path) -> Result<Pcm, String> {
             p0 = p1;
         }
     }
-    chunks.into_par_iter().try_for_each(|(p0, o0, len)| -> Result<(), String> {
+    // taken in order (par_bridge), so the start of the book is ready first
+    chunks.into_iter().par_bridge().try_for_each(|(p0, o0, len)| -> Result<(), String> {
         let mut dst = vec![0i16; len];
         let p1 = (p0 + chunk_packets).min(n);
         let d0 = p0.saturating_sub(pre);
@@ -1078,14 +1360,51 @@ fn decode_mp3(path: &Path) -> Result<Pcm, String> {
             let skip = (-x_start) as usize;
             rs.process(&mono[skip.min(mono.len())..], 0, o0, &mut dst);
         }
-        out.write_at(o0, &dst)
-    })?;
-    out.finish()
+        out.write_at(o0, &dst)?;
+        out.complete(o0, o0 + len);
+        Ok(())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resampler_four_at_a_time_matches_one_at_a_time() {
+        let mut s: u32 = 12345;
+        let x: Vec<f32> = (0..50_000)
+            .map(|_| {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+            })
+            .collect();
+        for (rate, x_start, out_start) in [(44100, 0, 0), (48000, 1000, 400), (22050, 7, 3), (44100, 30_000, 10_000)] {
+            let rs = Resampler::new(rate, OUT_RATE);
+            let n = rs.out_len(x.len()) - out_start.min(rs.out_len(x.len()));
+            let mut fast = vec![0i16; n];
+            rs.process(&x, x_start, out_start, &mut fast);
+            // reference: every output alone, as before
+            let taps = 2 * rs.half;
+            let slow: Vec<i16> = (0..n)
+                .map(|o| {
+                    let pos = (out_start + o) * rs.num;
+                    let first = (pos / rs.den) as isize - rs.half as isize + 1 - x_start as isize;
+                    let h = &rs.table[(pos % rs.den) * taps..(pos % rs.den + 1) * taps];
+                    let acc = if first >= 0 && first as usize + taps <= x.len() {
+                        dot(&x[first as usize..first as usize + taps], h)
+                    } else {
+                        (0..taps)
+                            .filter(|&k| first + k as isize >= 0 && ((first + k as isize) as usize) < x.len())
+                            .fold(0f32, |a, k| a + x[(first + k as isize) as usize] * h[k])
+                    };
+                    quantize(acc)
+                })
+                .collect();
+            let bad = fast.iter().zip(&slow).position(|(a, b)| a != b);
+            assert!(bad.is_none(), "rate {rate}: first difference at {bad:?} of {n}: {:?} vs {:?}", bad.map(|i| fast[i]), bad.map(|i| slow[i]));
+        }
+    }
 
     #[test]
     fn picks_the_track_in_the_models_language() {

@@ -106,9 +106,9 @@ pub fn match_start(audio: &[AudioFile], text: &[TextFile]) -> (Ats, Sta) {
             }
             if best.0 >= 0 {
                 let key = (best.0 as usize, best.1 as usize);
-                if !sta.contains_key(&key) {
+                if let std::collections::hash_map::Entry::Vacant(e) = sta.entry(key) {
                     ats.insert((ai, i), (key.0, key.1, best.2));
-                    sta.insert(key, (ai, i, best.2));
+                    e.insert((ai, i, best.2));
                 }
             }
         }

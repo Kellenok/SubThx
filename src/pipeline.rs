@@ -367,6 +367,98 @@ impl Engine {
         self.transcribe_with(audio, chapters, &mut |_, _| Ok(()))
     }
 
+    /// VAD and recognition of a sound that is still decoding into `sink`,
+    /// a block of [`vad::BLOCK_FRAMES`] at a time as it becomes final. VAD
+    /// probabilities and segments are those of the whole file at once (the
+    /// blocks lie on the model's chunks; a segment is taken once it is settled,
+    /// see [`vad::PostConfig::process_settled`]). Returns (start, end, text)
+    /// of every segment and the length of the sound.
+    fn recognize_blocks(
+        &mut self,
+        sink: &std::sync::Arc<crate::audio::Sink>,
+        tm: &mut Timings,
+        progress: &mut dyn FnMut(Stage, f64) -> Result<(), String>,
+    ) -> Result<(Vec<(usize, usize, String)>, usize), String> {
+        let post = vad::PostConfig::default();
+        let mut probs: Vec<f32> = Vec::new();
+        let mut f0 = 0;
+        // segments already recognized, and where the last of them ends
+        let mut sent: Vec<(usize, usize)> = Vec::new();
+        let mut asr_end = 0;
+        let mut utterances = Vec::new();
+        let mut asr_started = false;
+        loop {
+            let (ready, done) = sink.wait_ready(vad::frames_samples(f0 + vad::BLOCK_FRAMES))?;
+            let pcm = crate::audio::Pcm::live(sink.clone(), ready);
+            let t = Instant::now();
+            let f1 = if done { vad::Fbank::num_frames(ready) } else { f0 + vad::BLOCK_FRAMES };
+            if f1 > f0 {
+                if !asr_started {
+                    progress(Stage::Vad, 0.0)?;
+                }
+                probs.extend(self.vad.probs_frames(&pcm, &self.fbank, &self.cmvn, f0, f1)?);
+                f0 = f1;
+            }
+            let (decisions, settled) = post.process_settled(&probs);
+            let segs = vad::segments_samples(&decisions, ready);
+            let upto = if done {
+                segs.len()
+            } else {
+                // the same conversion as the segments' ends
+                let cut = (round3(settled as f64 / 100.0) * 16000.0) as usize;
+                segs.iter().take_while(|s| s.1 <= cut).count()
+            };
+            debug_assert_eq!(segs[..sent.len()], sent[..], "a settled VAD segment changed");
+            let chunks: Vec<Chunk> = segs[sent.len().min(upto)..upto]
+                .iter()
+                .map(|&(start, end)| Chunk { start, end: end.min(ready) })
+                .filter(|c| c.end > c.start)
+                .collect();
+            sent.extend_from_slice(&segs[sent.len().min(upto)..upto]);
+            tm.vad += t.elapsed().as_secs_f64();
+
+            if !chunks.is_empty() {
+                if !asr_started {
+                    progress(Stage::Asr, 0.0)?;
+                    asr_started = true;
+                }
+                // progress by the share of the sound recognized (its length is
+                // known from the start for MP4 and MP3)
+                let total = sink.len().max(ready).max(1) as f64;
+                let (a0, a1, n) = (asr_end as f64, chunks.last().unwrap().end as f64, chunks.len() as f64);
+                let mut on_batch = |k: usize| progress(Stage::Asr, ((a0 + (a1 - a0) * k as f64 / n) / total).min(1.0));
+                let t = Instant::now();
+                utterances.extend(self.recognize(&pcm, &chunks, &mut on_batch)?);
+                tm.asr += t.elapsed().as_secs_f64();
+                tm.chunks += chunks.len();
+                asr_end = chunks.last().unwrap().end;
+            }
+            if done {
+                return Ok((utterances, ready));
+            }
+        }
+    }
+
+    /// (start, end, text) of `chunks` of `audio`
+    fn recognize(
+        &mut self,
+        audio: &crate::audio::Pcm,
+        chunks: &[Chunk],
+        on_batch: &mut dyn FnMut(usize) -> Result<(), String>,
+    ) -> Result<Vec<(usize, usize, String)>, String> {
+        let with_chunks = |texts: Vec<String>| -> Vec<(usize, usize, String)> { chunks.iter().zip(texts).map(|(c, t)| (c.start, c.end, t)).collect() };
+        Ok(match &mut self.asr {
+            Asr::Parakeet(m) => with_chunks(m.transcribe_with(audio, chunks, self.batch_size, on_batch)?),
+            Asr::Kitsune(m) => with_chunks(m.transcribe_with(audio, chunks, self.batch_size, on_batch)?),
+            // an encoder-decoder: windows of 30 s, far heavier per item
+            Asr::Whisper(m) => m
+                .transcribe_with(audio, chunks, whisper_batch(self.batch_size, self.device), on_batch)?
+                .into_iter()
+                .map(|u| (u.start, u.end, u.text))
+                .collect(),
+        })
+    }
+
     /// [`Engine::transcribe`] reporting `progress(stage, fraction)`; an error
     /// from it (e.g. a cancelled job) stops the run between steps.
     pub fn transcribe_with(
@@ -378,47 +470,49 @@ impl Engine {
         let mut tm = Timings::default();
 
         progress(Stage::Decode, 0.0)?;
-        let t = Instant::now();
-        let wanted: Vec<&str> = match &self.language {
-            Some(l) => vec![l.as_str()],
-            None => self.languages.to_vec(),
+        let wanted: Vec<String> = match &self.language {
+            Some(l) => vec![l.clone()],
+            None => self.languages.iter().map(|l| l.to_string()).collect(),
         };
-        let wav = crate::audio::decode_pcm_for(audio, &wanted)?;
-        tm.decode = t.elapsed().as_secs_f64();
-        tm.audio_seconds = wav.len() as f64 / 16000.0;
-
-        progress(Stage::Vad, 0.0)?;
-        let t = Instant::now();
-        let probs = self.vad.probs_audio(&wav, &self.fbank, &self.cmvn)?;
-        let decisions = vad::PostConfig::default().process(&probs);
-        let chunks: Vec<Chunk> = vad::segments_samples(&decisions, wav.len())
-            .into_iter()
-            .map(|(start, end)| Chunk {
-                start,
-                end: end.min(wav.len()),
-            })
-            .filter(|c| c.end > c.start)
-            .collect();
-        tm.vad = t.elapsed().as_secs_f64();
-        tm.chunks = chunks.len();
-
-        progress(Stage::Asr, 0.0)?;
-        let t = Instant::now();
-        let n = chunks.len().max(1) as f64;
-        let mut on_batch = |done: usize| progress(Stage::Asr, done as f64 / n);
-        let with_chunks = |texts: Vec<String>| -> Vec<(usize, usize, String)> { chunks.iter().zip(texts).map(|(c, t)| (c.start, c.end, t)).collect() };
-        let utterances = match &mut self.asr {
-            Asr::Parakeet(m) => with_chunks(m.transcribe_with(&wav, &chunks, self.batch_size, &mut on_batch)?),
-            Asr::Kitsune(m) => with_chunks(m.transcribe_with(&wav, &chunks, self.batch_size, &mut on_batch)?),
-            // an encoder-decoder: windows of 30 s, far heavier per item
-            Asr::Whisper(m) => m
-                .transcribe_with(&wav, &chunks, whisper_batch(self.batch_size, self.device), &mut on_batch)?
-                .into_iter()
-                .map(|u| (u.start, u.end, u.text))
-                .collect(),
-        };
-        tm.asr = t.elapsed().as_secs_f64();
+        // decoding runs on its own (low priority) threads while the blocks
+        // decoded so far go through VAD and recognition
+        let sink = std::sync::Arc::new(crate::audio::Sink::new());
+        let (utterances, n_samples) = std::thread::scope(|sc| {
+            let decoder = {
+                let sink = sink.clone();
+                let wanted: Vec<&str> = wanted.iter().map(|l| l.as_str()).collect();
+                sc.spawn(move || {
+                    let t = Instant::now();
+                    // a panic in the decoder must not leave the reader waiting
+                    struct Close(std::sync::Arc<crate::audio::Sink>);
+                    impl Drop for Close {
+                        fn drop(&mut self) {
+                            self.0.close(Err("decoding stopped".into()));
+                        }
+                    }
+                    let close = Close(sink);
+                    let res = crate::audio::background_pool().install(|| crate::audio::decode_into(audio, &wanted, &close.0));
+                    close.0.close(res);
+                    t.elapsed().as_secs_f64()
+                })
+            };
+            let res = self.recognize_blocks(&sink, &mut tm, progress);
+            if res.is_err() {
+                sink.cancel();
+            }
+            tm.decode = decoder.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+            res
+        })?;
+        tm.audio_seconds = n_samples as f64 / 16000.0;
         if std::env::var_os("SUBTHX_PROFILE").is_some() {
+            let resample = crate::audio::RESAMPLE_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9;
+            eprintln!("  decode: resampling {resample:.2} CPU-s (all threads)");
+            let v = std::mem::take(&mut self.vad.profile);
+            eprintln!("  vad: features {:.2}s, waiting for them {:.2}s, model {:.2}s", v[0], v[1], v[2]);
+            if let Asr::Kitsune(m) = &mut self.asr {
+                let p = std::mem::take(&mut m.profile);
+                eprintln!("  kitsune: mel {:.2}s (in its own thread), model + waiting {:.2}s", p[0], p[1]);
+            }
             if let Asr::Parakeet(m) = &self.asr {
                 let p = m.profile;
                 eprintln!("  parakeet: mel {:.2}s, encoder {:.2}s, decode loop {:.2}s (decoder runs {:.2}s)", p[0], p[1], p[2], p[3]);

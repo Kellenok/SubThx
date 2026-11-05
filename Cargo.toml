@@ -10,24 +10,30 @@ unicode-normalization = "0.1"
 unicode-general-category = "1"
 memchr = "2.8.3"
 rayon = "1.12.0"
-zip = { version = "9.0.2", default-features = false, features = ["deflate"] }
-roxmltree = "0.21.1"
+zip = { version = "9.4.0", default-features = false, features = ["deflate"] }
+roxmltree = "0.21.2"
 html-escape = "0.3.0"
 percent-encoding = "2.3.2"
 clap = { version = "4.6.7", features = ["derive"] }
-realfft = "3.5.0"
+realfft = "3.5.1"
 ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "half", "download-binaries", "copy-dylibs", "directml", "cuda", "tls-native"] }
 symphonia = { version = "0.6.1", default-features = false, features = ["opt-simd", "all-codecs", "all-formats"] }
-tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "sync", "net", "fs", "signal", "io-util"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "net", "fs", "signal", "io-util"] }
 axum = { version = "0.8.9", features = ["multipart"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
-uuid = { version = "1.28.0", features = ["v4"] }
+uuid = { version = "1.29.0", features = ["v4"] }
 half = "2"
 ureq = { version = "3", default-features = false, features = ["native-tls"] }
-sha2 = "0.10"
+sha2 = "0.11"
+
+[features]
+# load onnxruntime.dll at run time (ORT_DYLIB_PATH or next to the exe) instead
+# of linking it: a build on toolchains without ort's prebuilt binaries
+# (x86_64-pc-windows-gnu): `cargo build --release --features load-dynamic`
+load-dynamic = ["ort/load-dynamic"]
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_System_SystemInformation"] }
+windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [profile.release]
 debug = 1
